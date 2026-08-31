@@ -202,12 +202,13 @@ def create_zarr(path, shape, chunks, dtype, chunk_locked=False, client=None):
     compressor = BloscCodec(
         cname='zstd', clevel=4, shuffle='bitshuffle',
     )
-    zarr_disk = zarr.open(
-        path, 'w',
+    zarr_disk = zarr.create_array(
+        path,
         shape=shape,
         chunks=chunks,
         dtype=dtype,
         compressors=compressor,
+        overwrite=True,
     )
 
     # this code is currently never used within CircuitSeeker
