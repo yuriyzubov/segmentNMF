@@ -236,7 +236,7 @@ def distributed_nmf(
         zarr_chunks = (128,) * segments.ndim
         segments_zarr_path = temp_dir_path + '/segments.zarr'
         segments_zarr = zarr.open(
-            segments_zarr_path, 'w',
+            segments_zarr_path, mode='w',
             shape=segments.shape,
             chunks=zarr_chunks,
             dtype=segments.dtype,
@@ -247,7 +247,7 @@ def distributed_nmf(
     # create reconstruction zarr array
     if reconstruction_path is not None:
         reconstruction_zarr = zarr.open(
-            reconstruction_path, 'w',
+            reconstruction_path, mode='w',
             shape=time_series_zarr.shape,
             chunks=time_series_zarr.chunks,
             dtype=np.float32,
@@ -264,7 +264,7 @@ def distributed_nmf(
         # store reconstruction weights as zarr
         rw_path = temp_dir_path + '/reconstruction_weights.zarr'
         reconstruction_weights_zarr = zarr.open(
-            rw_path, 'w',
+            rw_path, mode='w',
             shape=reconstruction_weights.shape,
             chunks=time_series_zarr.chunks[1:],
             dtype=reconstruction_weights.dtype,
