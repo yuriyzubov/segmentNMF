@@ -5,9 +5,9 @@ import copy
 
 from scipy.stats import entropy
 
-from zarr.indexing import BasicIndexer
+# from zarr.indexing import BasicIndexer  # removed in zarr v3, no replacement; see chunk_locked block below
 from zarr.codecs import BloscCodec
-from distributed import Lock
+# from distributed import Lock  # only used by the disabled chunk_locked block below
 
 from scipy.ndimage import binary_dilation as binary_dilation_scipy
 
@@ -212,15 +212,17 @@ def create_zarr(path, shape, chunks, dtype, chunk_locked=False, client=None):
 
     # this code is currently never used within CircuitSeeker
     # keeping it around in case a use case comes up
-    if chunk_locked:
-        indexer = BasicIndexer(slice(None), zarr_disk)
-        keys = (zarr_disk._chunk_key(idx.chunk_coords) for idx in indexer)
-        lock = {key: Lock(key, client=client) for key in keys}
-        lock['.zarray'] = Lock('.zarray', client=client)
-        zarr_disk = zarr.open(
-            store=zarr_disk.store, path=zarr_disk.path,
-            synchronizer=lock, mode='r+',
-        )
+    # Temporarily disabled for zarr v3: BasicIndexer/synchronizer= have no
+    # v3 equivalent (unported). Re-enable with a hand-rolled lock if needed.
+    # if chunk_locked:
+    #     indexer = BasicIndexer(slice(None), zarr_disk)
+    #     keys = (zarr_disk._chunk_key(idx.chunk_coords) for idx in indexer)
+    #     lock = {key: Lock(key, client=client) for key in keys}
+    #     lock['.zarray'] = Lock('.zarray', client=client)
+    #     zarr_disk = zarr.open(
+    #         store=zarr_disk.store, path=zarr_disk.path,
+    #         synchronizer=lock, mode='r+',
+    #     )
 
     return zarr_disk
 
