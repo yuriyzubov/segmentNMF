@@ -51,27 +51,22 @@ def file_handler(file_path):
         ValueError: If the file type is unsupported.
 
     """
-    file_extension = file_path.split('.')[-1].lower()
+    path_lower = file_path.lower().rstrip('/')
 
-    if file_extension == 'npy':
-        # Load numpy file and create temporary Zarr array
+    # Detect zarr first via substring -- supports paths into multi-scale
+    # groups like "/.../foo.zarr/s0" where the literal extension check fails.
+    if '.zarr' in path_lower:
+        return zarr.open(file_path, mode='r')
+
+    if path_lower.endswith('.npy'):
         data = np.load(file_path)
-        zarr_array = create_temp_zarr(data)
-        return zarr_array
+        return create_temp_zarr(data)
 
-    elif file_extension == 'zarr':
-        # Load zarr file (lazy loading)
-        data = zarr.open(file_path, mode='r')
-        return data
+    if path_lower.endswith('.nrrd'):
+        data, _ = nrrd.read(file_path)
+        return create_temp_zarr(data)
 
-    elif file_extension == 'nrrd':
-        # Load nrrd file and create temporary Zarr array
-        data, header = nrrd.read(file_path)
-        zarr_array = create_temp_zarr(data)
-        return zarr_array
-
-    else:
-        raise ValueError(f"Unsupported file type: {file_extension}")
+    raise ValueError(f"Unsupported file type: {file_path}")
 
 
 def dilate_outer_layers(im, rad=[1, 1, 1], k: int = 1):
