@@ -6,7 +6,7 @@ import copy
 from scipy.stats import entropy
 
 from zarr.indexing import BasicIndexer
-from numcodecs import Blosc
+from zarr.codecs import BloscCodec
 from distributed import Lock
 
 from scipy.ndimage import binary_dilation as binary_dilation_scipy
@@ -199,15 +199,15 @@ def create_zarr(path, shape, chunks, dtype, chunk_locked=False, client=None):
         zarr.core.Array: The Zarr array.
 
     """
-    compressor = Blosc(
-        cname='zstd', clevel=4, shuffle=Blosc.BITSHUFFLE,
+    compressor = BloscCodec(
+        cname='zstd', clevel=4, shuffle='bitshuffle',
     )
     zarr_disk = zarr.open(
         path, 'w',
         shape=shape,
         chunks=chunks,
         dtype=dtype,
-        compressor=compressor,
+        compressors=compressor,
     )
 
     # this code is currently never used within CircuitSeeker
