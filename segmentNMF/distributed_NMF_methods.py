@@ -240,7 +240,6 @@ def distributed_nmf(
             shape=segments.shape,
             chunks=zarr_chunks,
             dtype=segments.dtype,
-            synchronizer=zarr.ThreadSynchronizer(),
         )
         segments_zarr[...] = segments
 
@@ -251,7 +250,6 @@ def distributed_nmf(
             shape=time_series_zarr.shape,
             chunks=time_series_zarr.chunks,
             dtype=np.float32,
-            synchronizer=zarr.ThreadSynchronizer(),
         )
 
         # create weights array for reconstruction averaging
@@ -268,7 +266,6 @@ def distributed_nmf(
             shape=reconstruction_weights.shape,
             chunks=time_series_zarr.chunks[1:],
             dtype=reconstruction_weights.dtype,
-            synchronizer=zarr.ThreadSynchronizer(),
         )
         reconstruction_weights_zarr[...] = reconstruction_weights
 
