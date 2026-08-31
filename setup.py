@@ -21,5 +21,8 @@ setuptools.setup(
         'dask[distributed]',
         'tqdm',
         'torch',
-    ]
+    ],
+    extras_require={
+        'test': ['pytest'],
+    },
 )
