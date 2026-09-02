@@ -303,7 +303,7 @@ def distributed_nmf(
 
         #    determine relationship between segments and time series planes
         pf = int(np.round(sampling_ratio[0]))  # projection_factor
-        weights = np.abs(np.arange(-(pf//2), pf//2+1)) * segments_spacing[0]
+        weights = np.abs(np.arange(pf) - (pf - 1) / 2) * segments_spacing[0]
         weights = np.exp(-weights / neighborhood_sigma)
         plane_weights = np.empty((pf,) + segments.shape[1:], dtype=np.float32)
         plane_weights[...] = weights.reshape((pf,) + (1,) * (segments.ndim - 1))
