@@ -228,6 +228,24 @@ def create_zarr(path, shape, chunks, dtype, chunk_locked=False, client=None):
     return zarr_disk
 
 
+class _TransposedZarrArray:
+    """Read-only view of a Zarr array with permuted axes. Internal helper for align_zarr."""
+
+    def __init__(self, zarr_array, axes):
+        self._arr = zarr_array
+        self._axes = axes
+        self.shape = tuple(zarr_array.shape[a] for a in axes)
+        self.chunks = tuple(zarr_array.chunks[a] for a in axes)
+        self.dtype = zarr_array.dtype
+
+    def __getitem__(self, index):
+        orig_index = [slice(None)] * len(self._axes)
+        for t_axis, o_axis in enumerate(self._axes):
+            orig_index[o_axis] = index[t_axis]
+        data = self._arr[tuple(orig_index)]
+        return np.transpose(data, axes=self._axes)
+
+
 def vol_mutual_information(volume1, volume2):
     """
     Calculate the normalized correlation between two 3D volumes.
