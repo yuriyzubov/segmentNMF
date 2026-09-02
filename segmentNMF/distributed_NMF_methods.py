@@ -10,6 +10,20 @@ from segmentNMF.neighborhood import neighborhood_by_weights
 from segmentNMF.NMF_methods import nmf, nmf_pytorch
 
 
+def plane_weight_profile(projection_factor, spacing, sigma):
+    """The weight of each segment plane inside one time series plane.
+
+    `projection_factor` segment planes fall inside one time series plane. A
+    plane at the centre gets weight 1, and the weight falls with distance from
+    the centre. An even projection_factor has no centre plane, so every offset
+    is a half step and no weight reaches 1.
+
+    Returns `projection_factor` weights, whatever the parity.
+    """
+    offsets = np.abs(np.arange(projection_factor) - (projection_factor - 1) / 2)
+    return np.exp(-offsets * spacing / sigma)
+
+
 def distributed_nmf(
     time_series_zarr,
     segments,
@@ -306,8 +320,8 @@ def distributed_nmf(
 
         #    determine relationship between segments and time series planes
         pf = int(np.round(sampling_ratio[0]))  # projection_factor
-        weights = np.abs(np.arange(-(pf//2), pf//2+1)) * segments_spacing[0]
-        weights = np.exp(-weights / neighborhood_sigma)
+        weights = plane_weight_profile(pf, segments_spacing[0],
+                                       neighborhood_sigma)
         plane_weights = np.empty((pf,) + segments.shape[1:], dtype=np.float32)
         plane_weights[...] = weights.reshape((pf,) + (1,) * (segments.ndim - 1))
 
