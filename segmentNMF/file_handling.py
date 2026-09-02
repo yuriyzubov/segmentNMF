@@ -270,6 +270,28 @@ class _TransposedZarrArray:
         return np.transpose(data, axes=self._axes)
 
 
+class _CroppedArray:
+    """Read-only view of an array restricted to a sub-region. Internal helper for crop_view."""
+
+    def __init__(self, array, crop):
+        self._arr = array
+        self._crop = crop
+        self.shape = tuple(s.stop - s.start for s in crop)
+        self.chunks = array.chunks
+        self.dtype = array.dtype
+
+    def __getitem__(self, index):
+        if not isinstance(index, tuple):
+            index = (index,)
+        index = index + (slice(None),) * (len(self.shape) - len(index))
+        offset_index = tuple(
+            slice(c.start + (i.start if i.start is not None else 0),
+                  c.start + (i.stop if i.stop is not None else s))
+            for c, i, s in zip(self._crop, index, self.shape)
+        )
+        return self._arr[offset_index]
+
+
 def vol_mutual_information(volume1, volume2):
     """
     Calculate the normalized correlation between two 3D volumes.
