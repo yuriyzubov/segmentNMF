@@ -228,6 +228,30 @@ def create_zarr(path, shape, chunks, dtype, chunk_locked=False, client=None):
     return zarr_disk
 
 
+def align_zarr(time_series_path, segments_path):
+    """
+    Open a time series Zarr array with axes reordered to match segments.
+
+    Uses each array's dimension_names metadata to compute the reordering,
+    so no manual axis indices are needed. Time is placed first, followed by
+    the segments array's own spatial axis order.
+
+    Args:
+        time_series_path (str): Path to the time series Zarr store.
+        segments_path (str): Path to the segments Zarr store.
+
+    Returns:
+        _TransposedZarrArray: A read-only, axis-reordered view of the time
+            series array.
+    """
+    segments_arr = zarr.open(segments_path, mode='r')
+    time_series_arr = zarr.open(time_series_path, mode='r')
+    target_names = ('t',) + segments_arr.metadata.dimension_names
+    current_names = time_series_arr.metadata.dimension_names
+    axes = tuple(current_names.index(name) for name in target_names)
+    return _TransposedZarrArray(time_series_arr, axes)
+
+
 class _TransposedZarrArray:
     """Read-only view of a Zarr array with permuted axes. Internal helper for align_zarr."""
 
