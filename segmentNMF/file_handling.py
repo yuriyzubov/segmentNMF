@@ -270,6 +270,24 @@ class _TransposedZarrArray:
         return np.transpose(data, axes=self._axes)
 
 
+def crop_view(array, crop):
+    """
+    Restrict an array-like object to a sub-region, so indexing into the
+    result behaves as if the sub-region were its own array starting at 0.
+
+    Args:
+        array: Any array-like object supporting shape, chunks, dtype, and
+            __getitem__ with a tuple of slices (e.g. a zarr.Array or
+            _TransposedZarrArray).
+        crop (tuple of slice): One slice per axis, in the input array's own
+            index space. Must have one entry per axis of `array`.
+
+    Returns:
+        _CroppedArray: A read-only view restricted to the crop.
+    """
+    return _CroppedArray(array, crop)
+
+
 class _CroppedArray:
     """Read-only view of an array restricted to a sub-region. Internal helper for crop_view."""
 
