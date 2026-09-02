@@ -299,6 +299,9 @@ class _CroppedArray:
         self.dtype = array.dtype
 
     def __getitem__(self, index):
+        if not isinstance(index, tuple):
+            index = (index,)
+        index = index + (slice(None),) * (len(self.shape) - len(index))
         offset_index = tuple(
             slice(c.start + (i.start if i.start is not None else 0),
                   c.start + (i.stop if i.stop is not None else s))
