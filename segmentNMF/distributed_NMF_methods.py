@@ -299,7 +299,7 @@ def distributed_nmf(
         # read segments and time series
         time_series = time_series_zarr[(slice(None),) + time_series_crop]
         ts = time_series.shape
-        segments = segments_zarr[segments_crop]
+        segments = segments_zarr[segments_crop].copy()
 
         # ensure the segments of interest are the first components
         n_segments = len(segment_ids)
