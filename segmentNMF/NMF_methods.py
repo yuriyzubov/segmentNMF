@@ -152,7 +152,7 @@ def frobenius_norm(V, S, H):
 
 def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr=1,
                 S_lr=1e-6, objective_threshold=1e-6, estimate_noise_component=True,
-                min_iterations: int = 50):
+                min_iterations: int = 50, spatial_threshold: float = None):
     """Compute NMF using gradient descent
 
     Args:
@@ -168,6 +168,9 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
         objective_threshold: The stopping criterion for the objective (default: 1e-6).
         estimate_noise_component: Whether to estimate a noise component (default: True).
         min_iterations: The minimum number of iterations to run the algorithm for (default: 50).
+        spatial_threshold: Zero out spatial values below this fraction of their own component's
+            peak, once per iteration. Bounds how far a footprint can spread when B never reaches
+            zero. The noise component is exempt. None disables it (default: None).
 
     Returns:
         A tuple of NumPy arrays representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
@@ -216,6 +219,12 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
         S[:, :n_components] += S_gradient
         S = np.maximum(0, S)
         S = np.minimum(1, S)  # we want amplitude in temporal not spatial components
+
+        # per-component threshold, so a dim component cannot be erased
+        if spatial_threshold is not None:
+            fit = S[:, :n_components]
+            peak = fit.max(axis=0, keepdims=True)
+            fit[fit < spatial_threshold * peak] = 0
 
         # Save gradient steps
         S_gradients.append(np.mean(S_gradient))

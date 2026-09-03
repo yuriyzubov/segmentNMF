@@ -15,7 +15,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from segmentNMF.NMF_methods import nmf_pytorch  # noqa: E402
+from segmentNMF.NMF_methods import nmf, nmf_pytorch  # noqa: E402
 
 THRESHOLD = 0.3
 
@@ -81,6 +81,43 @@ def test_a_higher_threshold_never_keeps_more_voxels():
         S, _, _ = nmf_pytorch(spatial_threshold=t, **two_cell_toy())
         counts.append(int((S > 0).sum()))
     assert all(a >= b for a, b in zip(counts, counts[1:])), counts
+
+
+# ------------------------------------------------------------- the numpy nmf
+
+NMF_KW = dict(num_iterations=30, update_int=10 ** 6, H_lr=1e-1, S_lr=1e-1,
+              min_iterations=30, objective_threshold=None)
+
+
+def numpy_toy(**kw):
+    p = two_cell_toy(**kw)
+    for key in ("num_iterations", "update_int", "min_iterations"):
+        p.pop(key)
+    return p
+
+
+def test_the_numpy_nmf_applies_the_same_rule():
+    """Both implementations must mean the same thing by spatial_threshold."""
+    S, _, _ = nmf(spatial_threshold=THRESHOLD, estimate_noise_component=False,
+                  **numpy_toy(), **NMF_KW)
+    for c in range(S.shape[1]):
+        column = S[:, c]
+        alive = column[column > 0]
+        assert alive.size > 0, f"component {c} was erased"
+        assert alive.min() >= THRESHOLD * column.max() - 1e-6
+
+
+def test_the_numpy_nmf_is_unchanged_when_the_threshold_is_off():
+    a, _, _ = nmf(spatial_threshold=None, estimate_noise_component=False,
+                  **numpy_toy(), **NMF_KW)
+    b, _, _ = nmf(estimate_noise_component=False, **numpy_toy(), **NMF_KW)
+    np.testing.assert_array_equal(a, b)
+
+
+# NOTE: the threshold exempts the noise column, by slicing S[:, :n_components].
+# That is not tested here. The noise column holds 1 / n_voxels at every voxel,
+# so it is uniform, and a per-component threshold never removes any of it. The
+# exemption is only visible against a GLOBAL peak, which this code never uses.
 
 
 if __name__ == "__main__":
