@@ -37,6 +37,7 @@ def distributed_nmf(
     neighborhood='weights',
     neighborhood_sigma=2.0,
     neighborhood_radius=None,
+    spatial_threshold=None,
     temporary_directory=None,
     use_gpu=False,
     n_output_segments=None,
@@ -120,6 +121,15 @@ def distributed_nmf(
         component may extend past its segment. Not to be confused with
         max_neighbor_distance, which controls how cells are grouped into
         blocks and has nothing to do with B.
+
+    spatial_threshold : float (default: None)
+        If not None, every spatial component is zeroed below this fraction of
+        its own peak, once per nmf iteration. This bounds the creep described
+        under neighborhood='weights': a voxel survives only if a single
+        gradient step can lift it above the threshold, so a faint halo is
+        removed as fast as it forms. The threshold is relative to each
+        component, so a dim segment cannot be erased. A useful starting value
+        is 0.05.
 
     temporary_directory : string (default: None)
         Temporary files are created during nmf. The temporary files will be
@@ -420,12 +430,14 @@ def distributed_nmf(
         if use_gpu:
             S_res, H_res, objectives = nmf_pytorch(
                 V, S, H, B,
+                spatial_threshold=spatial_threshold,
                 **kwargs,
             )
         else:
             S_res, H_res, objectives = nmf(
                 V, S, H, B,
                 estimate_noise_component=False,
+                spatial_threshold=spatial_threshold,
                 **kwargs,
             )
 
