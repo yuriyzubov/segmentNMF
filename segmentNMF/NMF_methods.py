@@ -272,7 +272,8 @@ def frobenius_norm_pytorch(V, S, H):
 
 
 def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr: float = 1e-1,
-                S_lr: float = 1e-1, objective_threshold: float = 1e-2, min_iterations: int = 50):
+                S_lr: float = 1e-1, objective_threshold: float = 1e-2, min_iterations: int = 50,
+                spatial_threshold: float = None):
 
     """Compute NMF using gradient descent
 
@@ -288,6 +289,9 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         S_lr: The learning rate for the S matrix (default: 1e-6).
         objective_threshold: The stopping criterion for the objective (default: 1e-2).
         min_iterations: The minimum number of iterations to run the algorithm for (default: 50).
+        spatial_threshold: Zero out spatial values below this fraction of their own component's
+            peak, once per iteration. Bounds how far a footprint can spread when B never reaches
+            zero. None disables it (default: None).
 
     Returns:
         A tuple of PyTorch tensors representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
@@ -319,6 +323,8 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
     S_step_size = S_lr
     H_step_size = H_lr
 
+    zero = torch.zeros((), device=device, dtype=S.dtype)
+
     print('Run gradient NMF | max iterations: {}'.format(num_iterations))
     # Perform projected gradient iterations
     for i in tqdm(range(num_iterations)):
@@ -341,6 +347,11 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         S += S_gradient
         S = torch.maximum(S, torch.Tensor([0]).to(S.device))
         S = torch.minimum(S, torch.Tensor([1]).to(S.device))  # we want amplitude in temporal not spatial components
+
+        # per-component threshold, so a dim component cannot be erased
+        if spatial_threshold is not None:
+            peak = S.max(dim=0, keepdim=True).values
+            S = torch.where(S < spatial_threshold * peak, zero, S)
 
         # Save gradient steps
         S_gradients.append(torch.mean(S_gradient).item())
