@@ -5,8 +5,9 @@ import time
 import glob
 from ClusterWrap.decorator import cluster as cluster_decorator
 from scipy.ndimage import find_objects
+from scipy.sparse import coo_matrix
 from scipy.spatial import cKDTree
-from segmentNMF.neighborhood import neighborhood_by_weights
+from segmentNMF.neighborhood import neighborhood_by_distance, neighborhood_by_weights
 from segmentNMF.NMF_methods import nmf, nmf_pytorch
 
 
@@ -33,11 +34,14 @@ def distributed_nmf(
     max_neighbor_distance=20.0,
     block_radius=4.0,
     time_series_baseline=None,
+    neighborhood='weights',
     neighborhood_sigma=2.0,
+    neighborhood_radius=None,
     temporary_directory=None,
     use_gpu=False,
     n_output_segments=None,
     reconstruction_path=None,
+    return_spatial_components=False,
     cluster=None,
     cluster_kwargs={},
     **kwargs,
@@ -83,12 +87,39 @@ def distributed_nmf(
     time_series_baseline : float (default: None)
         A scalar baseline value to subtract from the time series. Ignored if None.
 
+    neighborhood : 'weights' or 'distance' (default: 'weights')
+        Which neighborhood matrix B to constrain spatial components with.
+
+        'weights' uses neighborhood_by_weights: a smooth exponential falloff
+        that also accounts for sub-plane z position, recovered from the plane
+        weights in S. This is the only option that understands anisotropic
+        data where segments are finer in z than the time series, which is the
+        usual case here. It damps the growth *rate* but never reaches zero, so
+        footprints keep creeping outward the longer you iterate, bounded only
+        by the block crop.
+
+        'distance' uses neighborhood_by_distance: exactly zero beyond
+        neighborhood_radius, so a footprint cannot grow past it no matter
+        how many iterations are run. Inside that radius it is binary, so
+        growth runs at full rate up to the boundary. Has no notion of
+        sub-plane z position.
+
     neighborhood_sigma : float (default: 2.0)
-        Spatial component learning rates are scaled by weights that enforce
-        the prior given structure. The weight function is:
+        Only used when neighborhood == 'weights'. Spatial component learning
+        rates are scaled by weights that enforce the prior given structure.
+        The weight function is:
         np.exp( -dist / neighborhood_sigma ) where dist is the distance of
         a location in the spatial component from the boundary of the given
         segment. Larger values allow spatial components to grow more.
+        Note the weights are squared, so the effective falloff length is
+        neighborhood_sigma / 2.
+
+    neighborhood_radius : float (default: None)
+        Required when neighborhood == 'distance', otherwise ignored. The hard
+        limit, in the units of time_series_spacing, on how far a spatial
+        component may extend past its segment. Not to be confused with
+        max_neighbor_distance, which controls how cells are grouped into
+        blocks and has nothing to do with B.
 
     temporary_directory : string (default: None)
         Temporary files are created during nmf. The temporary files will be
@@ -112,6 +143,11 @@ def distributed_nmf(
         If not None, this should be a path to a place on disk where a zarr
         array can be created to contain the reconstruction:
         space_components @ time_components.
+
+    return_spatial_components : bool (default: False)
+        If True, also return the optimized spatial components, as a sparse
+        matrix. Off by default because it changes the return type from an
+        array to a tuple.
 
     cluster : ClusterWrap.cluster object (default: None)
         Only set if you have constructed your own static cluster. The default
@@ -139,7 +175,22 @@ def distributed_nmf(
         integer value found in the `segments` array. If `n_output_segments` is
         an integer then N is that number. Integer values not present in
         the `segments` array are NaN value for all T.
+
+    space_components : scipy.sparse.csc_matrix
+        Only returned if `return_spatial_components` is True. An SxN array
+        where S is the number of voxels in one time series frame, flattened
+        C-order, and N matches time_components. Column i is the optimized
+        spatial footprint of the same segment as row i of time_components.
+        Sparse because each footprint is nonzero over only a small part of
+        the volume; densifying the whole thing is tens of GB.
     """
+
+    # fail here rather than inside every block
+    assert neighborhood in ('weights', 'distance'), \
+        f"neighborhood must be 'weights' or 'distance', got {neighborhood!r}"
+    if neighborhood == 'distance':
+        assert neighborhood_radius is not None, \
+            "neighborhood='distance' requires neighborhood_radius"
 
     # get all segment ids
     print('GETTING UNIQUE SEGMENT IDS')
@@ -349,11 +400,18 @@ def distributed_nmf(
             S[:, i] = comp.reshape(np.prod(ts[1:]))
 
         # format search neighborhoods
-        B = neighborhood_by_weights(
-            S, segments_shape=ts[1:],
-            sigma=neighborhood_sigma,
-            spacing=time_series_spacing,
-        )
+        if neighborhood == 'weights':
+            B = neighborhood_by_weights(
+                S, segments_shape=ts[1:],
+                sigma=neighborhood_sigma,
+                spacing=time_series_spacing,
+            )
+        else:
+            B = neighborhood_by_distance(
+                S, segments_shape=ts[1:],
+                max_dist=neighborhood_radius,
+                spacing=time_series_spacing,
+            )
 
         # format the temporal components
         H = np.zeros((n_labels, ts[0]), dtype=np.float32)
@@ -386,7 +444,12 @@ def distributed_nmf(
             )
 
         # time series for the complete cells are what we really need
-        return H_res[:n_segments]
+        if not return_spatial_components:
+            return H_res[:n_segments]
+
+        # sparsify here, not in the caller, to keep the cluster transfer small
+        S_complete = coo_matrix(S_res[:, :n_segments])
+        return H_res[:n_segments], (S_complete, time_series_crop)
 
 
     def reconstruct_per_block(crop):
@@ -474,6 +537,11 @@ def distributed_nmf(
         cluster=cluster, cluster_kwargs=cluster_kwargs,
     )
 
+    # blocks return (H, (S, crop)) pairs when spatial components were requested
+    if return_spatial_components:
+        segment_spatial_components = [x[1] for x in segment_time_components]
+        segment_time_components = [x[0] for x in segment_time_components]
+
     # construct the return array and send it
     output_shape = (n_output_segments, time_series_zarr.shape[0])
     all_time_components = np.empty(output_shape, dtype=np.float32)
@@ -481,5 +549,27 @@ def distributed_nmf(
     for segment_union, components in zip(segment_unions, segment_time_components):
         for segment_id, component in zip(segment_union, components):
             all_time_components[segment_id-1, :] = component
-    return all_time_components
+    if not return_spatial_components:
+        return all_time_components
+
+    # assemble one global sparse (voxels, segments) matrix from the block crops
+    canvas_shape = time_series_zarr.shape[1:]
+    rows, cols, vals = [], [], []
+    for segment_union, (S_block, crop) in zip(segment_unions, segment_spatial_components):
+        crop_shape = tuple(s.stop - s.start for s in crop)
+        offsets = np.array([s.start for s in crop])
+        # crop-local flat row -> 3D -> global 3D -> canvas flat row
+        local_3d = np.unravel_index(S_block.row, crop_shape)
+        global_3d = tuple(c + o for c, o in zip(local_3d, offsets))
+        rows.append(np.ravel_multi_index(global_3d, canvas_shape))
+        # block column j is the j'th complete cell, whose label is segment_union[j]
+        cols.append(np.asarray(segment_union, dtype=np.int64)[S_block.col] - 1)
+        vals.append(S_block.data)
+
+    all_spatial_components = coo_matrix(
+        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(int(np.prod(canvas_shape)), n_output_segments),
+        dtype=np.float32,
+    ).tocsc()
+    return all_time_components, all_spatial_components
 
