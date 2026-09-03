@@ -291,11 +291,11 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         A tuple of PyTorch tensors representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
     """
 
-    # Convert numpy arrays to PyTorch tensors
-    V = torch.tensor(V, dtype=torch.float64)
-    S_init = torch.tensor(S_init, dtype=torch.float64)
-    H_init = torch.tensor(H_init, dtype=torch.float64)
-    B = torch.tensor(B, dtype=torch.float64)
+    # float32: inputs are uint16 data, and most GPUs run FP64 far slower
+    V = torch.tensor(V, dtype=torch.float32)
+    S_init = torch.tensor(S_init, dtype=torch.float32)
+    H_init = torch.tensor(H_init, dtype=torch.float32)
+    B = torch.tensor(B, dtype=torch.float32)
 
     # Check if GPU is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
