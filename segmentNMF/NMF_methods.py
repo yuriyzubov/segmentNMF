@@ -150,6 +150,40 @@ def frobenius_norm(V, S, H):
     return objective
 
 
+def objective_settled(objectives, i, rtol, window, min_iterations):
+    """True once the objective has stopped falling by a meaningful fraction.
+
+    Replaces an older rule that had two faults. That rule compared an ABSOLUTE
+    difference between two iterations, so one setting could not serve blocks of
+    different size: the objective is a Frobenius norm, which grows with the
+    voxel count. And it stopped on a single uphill step, which gradient descent
+    produces routinely while it is still making progress.
+
+    Here the mean of the last `window` objectives is compared against the mean
+    of the `window` before it, and the drop is asked for as a FRACTION. The mean
+    absorbs step to step noise. The fraction removes the block size, so the same
+    rtol means the same thing on a 128^3 core and on a single cell block.
+
+    A window that rises gives a negative drop, which is below any positive rtol.
+    A real increase therefore still stops the fit, but a single step cannot.
+
+    Tested only every `window` iterations, so the two windows never overlap.
+    """
+    n = i + 1
+    if rtol is None or n < max(min_iterations, 2 * window) or n % window != 0:
+        return False
+    prev = float(np.mean(objectives[n - 2 * window:n - window]))
+    curr = float(np.mean(objectives[n - window:n]))
+    if prev <= 0:
+        return False
+    drop = (prev - curr) / prev
+    if drop < rtol:
+        print('Objective settled: relative drop {:.2e} over {} iterations '
+              '< {:.2e}'.format(drop, window, rtol))
+        return True
+    return False
+
+
 def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr=1,
                 S_lr=1e-6, objective_threshold=1e-6, estimate_noise_component=True,
                 min_iterations: int = 50):
