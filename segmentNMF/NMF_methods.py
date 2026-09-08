@@ -184,6 +184,36 @@ def objective_settled(objectives, i, rtol, window, min_iterations):
     return False
 
 
+def footprint_settled(nnz_history, rtol):
+    """True once the number of surviving spatial voxels has stopped changing.
+
+    The objective is not enough on its own. It goes flat as soon as the fit is
+    good enough, but the footprint keeps shrinking for thousands of iterations
+    after that. The reason was measured on crop9: a voxel is deleted only when
+    its OWN weight decays past the threshold. The threshold itself never moves,
+    because S is clipped at 1 and every component's peak sits at 1. So voxels
+    keep dropping out one by one while the objective stands still.
+
+    Numbers from that measurement, at spatial_threshold 0.45: the objective rule
+    fired at iteration 250, where the footprint was still 16 percent larger than
+    its final size. It reached its final size near 1200.
+
+    `nnz_history` must be sampled on a fixed interval, so that two neighbouring
+    entries are always the same number of iterations apart.
+    """
+    if len(nnz_history) < 2:
+        return False
+    prev, curr = nnz_history[-2], nnz_history[-1]
+    if curr <= 0:
+        return False
+    change = abs(prev - curr) / curr
+    if change < rtol:
+        print('Footprint settled: {} voxels, {:.2e} relative change'.format(
+            curr, change))
+        return True
+    return False
+
+
 def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr=1,
                 S_lr=1e-6, objective_threshold=1e-6, estimate_noise_component=True,
                 min_iterations: int = 50):
