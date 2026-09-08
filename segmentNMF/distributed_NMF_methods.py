@@ -38,6 +38,7 @@ def distributed_nmf(
     neighborhood_sigma=2.0,
     neighborhood_radius=None,
     spatial_threshold=None,
+    spatial_smoothness=None,
     temporary_directory=None,
     use_gpu=False,
     n_output_segments=None,
@@ -131,6 +132,21 @@ def distributed_nmf(
         component, so a dim segment cannot be erased. A useful starting value
         is 0.05.
 
+    spatial_smoothness : float (default: None)
+        Passed to nmf_pytorch. Moves each spatial weight this fraction of the
+        way toward the mean of its lateral neighbours, once per iteration, and
+        then spatial_threshold cuts. None or 0 disables it. Requires
+        use_gpu=True, because only the pytorch nmf implements it.
+
+        This repairs the damage spatial_threshold does on its own. The threshold
+        decides one voxel at a time, so it cuts a smooth halo into fragments.
+        The fragments sit at the same distance from the seed as the legitimate
+        halo, so neighborhood='distance' cannot remove them without removing
+        the halo too.
+
+        nmf_pytorch also needs spatial_shape. That is supplied per block, so it
+        is not a parameter here.
+
     temporary_directory : string (default: None)
         Temporary files are created during nmf. The temporary files will be
         in their own folder within the `temporary_directory`. The default is the
@@ -201,6 +217,9 @@ def distributed_nmf(
     if neighborhood == 'distance':
         assert neighborhood_radius is not None, \
             "neighborhood='distance' requires neighborhood_radius"
+    if spatial_smoothness:
+        assert use_gpu, \
+            "spatial_smoothness requires use_gpu=True; only nmf_pytorch has it"
 
     # get all segment ids
     print('GETTING UNIQUE SEGMENT IDS')
@@ -431,6 +450,10 @@ def distributed_nmf(
             S_res, H_res, objectives = nmf_pytorch(
                 V, S, H, B,
                 spatial_threshold=spatial_threshold,
+                spatial_smoothness=spatial_smoothness,
+                # the canvas this block's S lives on, so nmf_pytorch can find
+                # a voxel's lateral neighbours. Same shape B was built with.
+                spatial_shape=ts[1:],
                 **kwargs,
             )
         else:
