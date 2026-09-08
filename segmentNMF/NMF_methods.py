@@ -184,6 +184,33 @@ def objective_settled(objectives, i, rtol, window, min_iterations):
     return False
 
 
+def footprint_settled(nnz_history, rtol):
+    """True once the number of surviving spatial voxels has stopped changing.
+
+    The reconstruction error ||V - S @ H|| is not enough on its own. It goes
+    flat as soon as the fit is good, but the footprint keeps shrinking long
+    after that. A voxel is deleted only when its OWN weight decays past
+    spatial_threshold, and that threshold never moves, because S is clipped at
+    1 and every component's peak sits at 1. So voxels keep dropping out one by
+    one while the error stands still. A run stopped on the error alone can
+    leave a footprint well above its final size.
+
+    `nnz_history` must be sampled on a fixed interval, so that two neighbouring
+    entries are always the same number of iterations apart.
+    """
+    if len(nnz_history) < 2:
+        return False
+    prev, curr = nnz_history[-2], nnz_history[-1]
+    if curr <= 0:
+        return False
+    change = abs(prev - curr) / curr
+    if change < rtol:
+        print('Footprint settled: {} voxels, {:.2e} relative change'.format(
+            curr, change))
+        return True
+    return False
+
+
 def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr=1,
                 S_lr=1e-6, objective_threshold=1e-6, estimate_noise_component=True,
                 min_iterations: int = 50, spatial_threshold: float = None):

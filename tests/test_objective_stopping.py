@@ -8,7 +8,7 @@ The rule these tests cover replaced two faults:
 Each test below pins one of those two properties down.
 """
 
-from segmentNMF.NMF_methods import objective_settled
+from segmentNMF.NMF_methods import footprint_settled, objective_settled
 
 WINDOW = 5
 MIN_IT = 0
@@ -84,3 +84,18 @@ def test_none_disables_the_rule():
     """rtol None must never stop the fit."""
     flat = [100.0] * 40
     assert settle_step(flat, rtol=None) is None
+
+
+def test_footprint_settled_needs_two_samples():
+    """One sample cannot show a change, so it must never stop the fit."""
+    assert footprint_settled([500], 1e-3) is False
+    assert footprint_settled([], 1e-3) is False
+
+
+def test_footprint_settled_reads_a_relative_change():
+    """The test is a fraction of the current count, not an absolute count."""
+    assert footprint_settled([1000, 1000], 1e-3) is True
+    assert footprint_settled([1002, 1000], 1e-3) is False   # 0.2 percent
+    assert footprint_settled([1000000, 1000200], 1e-3) is True
+    # an empty footprint carries no information, so it must not count as settled
+    assert footprint_settled([0, 0], 1e-3) is False
