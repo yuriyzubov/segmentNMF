@@ -8,7 +8,11 @@ The rule these tests cover replaced two faults:
 Each test below pins one of those two properties down.
 """
 
-from segmentNMF.NMF_methods import footprint_settled, objective_settled
+import numpy as np
+import pytest
+
+from segmentNMF.NMF_methods import (footprint_settled, nmf,
+                                    objective_settled)
 
 WINDOW = 5
 MIN_IT = 0
@@ -86,6 +90,85 @@ def test_none_disables_the_rule():
     assert settle_step(flat, rtol=None) is None
 
 
+def toy_problem(seed=0, n_vox=60, n_time=40, k=2, noise=0.05):
+    """A small rank k problem, plus a start point close to the true answer.
+
+    V carries noise on purpose. Without it the objective falls toward zero at a
+    fixed fraction per step, and a relative rule then never settles. Real data
+    always leaves a positive floor, and that floor is what makes the rule fire.
+
+    nmf writes into S_init and H_init in place when the noise component is off,
+    so every call must get its own copy. Returns a fresh kwargs dict each time.
+    """
+    rng = np.random.default_rng(seed)
+    S_true = rng.random((n_vox, k)).astype(np.float32)
+    H_true = rng.random((k, n_time)).astype(np.float32)
+    V = S_true @ H_true + noise * rng.standard_normal((n_vox, n_time))
+    return dict(
+        V=V.astype(np.float32),
+        S_init=(S_true + 0.1 * rng.random((n_vox, k))).astype(np.float32),
+        H_init=(H_true + 0.1 * rng.random((k, n_time))).astype(np.float32),
+        B=np.ones((n_vox, k), dtype=np.float32),
+    )
+
+
+# footprint_rtol off, so these tests isolate the objective rule. The two rules
+# are deliberately independent requirements; see test_both_rules_must_agree.
+NMF_KW = dict(num_iterations=1000, update_int=10 ** 6, H_lr=1e-1, S_lr=1e-1,
+              estimate_noise_component=False, min_iterations=0,
+              footprint_rtol=None)
+
+
+def test_nmf_stops_early_and_on_a_boundary():
+    """End to end: the rule must cut a real nmf run short, at a window boundary."""
+    p = toy_problem()
+    _, _, objectives = nmf(p["V"], p["S_init"], p["H_init"], p["B"],
+                           objective_rtol=1e-4, objective_window=25, **NMF_KW)
+    assert len(objectives) < 1000, "the rule never fired"
+    assert len(objectives) % 25 == 0, "stopped off a window boundary"
+
+
+def test_nmf_runs_to_the_end_when_both_rules_are_off():
+    """Both rtols None must let the run reach num_iterations.
+
+    One None alone is not enough. It drops that test as a requirement, and the
+    other test can then stop the run on its own.
+    """
+    p = toy_problem()
+    _, _, objectives = nmf(p["V"], p["S_init"], p["H_init"], p["B"],
+                           objective_rtol=None, **NMF_KW)
+    assert len(objectives) == 1000
+
+
+def test_footprint_rule_alone_can_stop_the_run():
+    """With the objective test off, a settled footprint must still stop the fit."""
+    p = toy_problem()
+    kw = dict(NMF_KW)
+    kw["footprint_rtol"] = 1e-3
+    _, _, objectives = nmf(p["V"], p["S_init"], p["H_init"], p["B"],
+                           objective_rtol=None, footprint_window=50, **kw)
+    assert len(objectives) < 1000, "the footprint rule never fired"
+    assert len(objectives) % 50 == 0, "stopped off a footprint window boundary"
+
+
+def test_both_rules_must_agree():
+    """With both rules on, the run cannot stop before EITHER is satisfied.
+
+    The footprint settles later than the objective on real data, so requiring
+    both must not stop earlier than requiring the footprint alone.
+    """
+    kw = dict(NMF_KW)
+    kw["footprint_rtol"] = 1e-3
+    p = toy_problem()
+    _, _, only_fp = nmf(p["V"], p["S_init"], p["H_init"], p["B"],
+                        objective_rtol=None, footprint_window=50, **kw)
+    q = toy_problem()
+    _, _, both = nmf(q["V"], q["S_init"], q["H_init"], q["B"],
+                     objective_rtol=1e-4, objective_window=25,
+                     footprint_window=50, **kw)
+    assert len(both) >= len(only_fp)
+
+
 def test_footprint_settled_needs_two_samples():
     """One sample cannot show a change, so it must never stop the fit."""
     assert footprint_settled([500], 1e-3) is False
@@ -99,3 +182,30 @@ def test_footprint_settled_reads_a_relative_change():
     assert footprint_settled([1000000, 1000200], 1e-3) is True
     # an empty footprint carries no information, so it must not count as settled
     assert footprint_settled([0, 0], 1e-3) is False
+
+
+# NOTE: scale freeness is tested on synthetic curves, in test_scale_free, and
+# not end to end. Scaling V inside nmf also scales the gradients, while H_lr and
+# S_lr stay fixed. The scaled run then follows a different path and can diverge,
+# so such a test would measure the learning rates, not the stopping rule.
+
+
+def test_objective_threshold_is_accepted_and_ignored():
+    """The deprecated argument must load, and must change nothing.
+
+    A threshold of 1e9 would have stopped the old rule on the first iteration
+    after min_iterations. Here both runs must produce the same curve.
+    """
+    kw = dict(num_iterations=30, update_int=1000, H_lr=1e-3, S_lr=1e-3,
+              estimate_noise_component=False, objective_rtol=None)
+    p = toy_problem(seed=1)
+    _, _, a = nmf(p["V"], p["S_init"], p["H_init"], p["B"], **kw)
+    q = toy_problem(seed=1)
+    _, _, b = nmf(q["V"], q["S_init"], q["H_init"], q["B"],
+                  objective_threshold=1e9, **kw)
+    assert len(a) == len(b) == 30
+    np.testing.assert_allclose(a, b)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

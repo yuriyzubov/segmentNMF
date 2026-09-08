@@ -212,8 +212,10 @@ def footprint_settled(nnz_history, rtol):
 
 
 def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr=1,
-                S_lr=1e-6, objective_threshold=1e-6, estimate_noise_component=True,
-                min_iterations: int = 50, spatial_threshold: float = None):
+                S_lr=1e-6, objective_threshold=None, estimate_noise_component=True,
+                min_iterations: int = 50, spatial_threshold: float = None,
+                objective_rtol: float = 1e-4, objective_window: int = 50,
+                footprint_rtol: float = 1e-3, footprint_window: int = 100):
     """Compute NMF using gradient descent
 
     Args:
@@ -226,9 +228,26 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
         update_int: The interval at which to display progress updates (default: 10).
         H_lr: The learning rate for the H matrix (default: 1).
         S_lr: The learning rate for the S matrix (default: 1e-6).
-        objective_threshold: The stopping criterion for the objective (default: 1e-6).
+        objective_threshold: Deprecated and ignored. It compared an absolute objective
+            difference between two neighbouring iterations, which cannot work across block
+            sizes. Kept only so that older configs still load. Use objective_rtol.
         estimate_noise_component: Whether to estimate a noise component (default: True).
         min_iterations: The minimum number of iterations to run the algorithm for (default: 50).
+        objective_rtol: Stop once the objective's mean falls by less than this FRACTION over
+            objective_window iterations, against the window before it. Scale free, so one
+            value fits every block size. None disables it (default: 1e-4).
+        objective_window: How many iterations each of the two compared means covers
+            (default: 50). The test runs every objective_window iterations.
+        footprint_rtol: Stop once the count of surviving spatial voxels changes by less
+            than this FRACTION over footprint_window iterations. Needed because the
+            objective settles long before the footprint does. None disables it
+            (default: 1e-3).
+        footprint_window: How many iterations between two voxel counts (default: 100).
+            The count costs about 0.02 percent of the run time at this window.
+
+        Early stopping needs EVERY enabled test to pass. Setting one of the two rtols
+        to None removes that test as a requirement, it does not switch early stopping
+        off. To run all num_iterations, set objective_rtol AND footprint_rtol to None.
         spatial_threshold: Zero out spatial values below this fraction of their own component's
             peak, once per iteration. Bounds how far a footprint can spread when B never reaches
             zero. The noise component is exempt. None disables it (default: None).
@@ -252,6 +271,10 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
     correlations = []
     H_gradients = []
     S_gradients = []
+    # sampled every footprint_window iterations, so two neighbouring entries are
+    # always the same distance apart
+    nnz_history = []
+    objective_done = False
 
     S = S_init
     H = H_init
@@ -305,14 +328,24 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
                                                                               np.min(correlations[-1]))
             tqdm.write(progress_str)
 
-        # Check stopping criterion
-        if objective_threshold is not None and i > min_iterations:
-            if abs(objectives[i] - objectives[i - 1]) < objective_threshold:
-                print('Reached stopping criterion (d objective < {})'.format(objective_threshold))
-                break
-            if objectives[i] > objectives[i - 1]:
-                print('Objective increased: [i-1]: {}, [i]: {}'.format(objectives[i-1], objectives[i]))
-                break
+        # Check stopping criterion.
+        #
+        # Both tests must pass, because they settle at very different times.
+        # The objective goes flat once the fit is good enough. The footprint
+        # keeps shrinking well past that point. See footprint_settled.
+        if footprint_window and (i + 1) % footprint_window == 0:
+            nnz_history.append(int(np.count_nonzero(S[:, :n_components])))
+        if objective_rtol is None and footprint_rtol is None:
+            continue
+        if objective_rtol is not None:
+            objective_done = objective_done or objective_settled(
+                objectives, i, objective_rtol, objective_window, min_iterations)
+            if not objective_done:
+                continue
+        if footprint_rtol is not None and not footprint_settled(
+                nnz_history, footprint_rtol):
+            continue
+        break
 
     if H_true is not None:
         return S, H, objectives, correlations
