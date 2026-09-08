@@ -190,6 +190,25 @@ def test_footprint_settled_reads_a_relative_change():
 # so such a test would measure the learning rates, not the stopping rule.
 
 
+def test_pytorch_stops_at_the_same_iteration():
+    """Both implementations share one rule, so both must stop on the same step.
+
+    nmf_pytorch uses the GPU when one is present. The problem here is 60 by 40,
+    so the run costs almost nothing on a shared card.
+    """
+    torch = pytest.importorskip("torch")
+    del torch
+    from segmentNMF.NMF_methods import nmf_pytorch
+
+    kw = dict(objective_rtol=1e-4, objective_window=25, **NMF_KW)
+    p = toy_problem()
+    _, _, a = nmf(p["V"], p["S_init"], p["H_init"], p["B"], **kw)
+    q = toy_problem()
+    kw.pop("estimate_noise_component")       # nmf_pytorch has no such option
+    _, _, b = nmf_pytorch(q["V"], q["S_init"], q["H_init"], q["B"], **kw)
+    assert len(a) == len(b)
+
+
 def test_objective_threshold_is_accepted_and_ignored():
     """The deprecated argument must load, and must change nothing.
 
