@@ -416,23 +416,43 @@ def parse_spatial_smoothness(value):
     return sum(w), tuple(v / top for v in w)
 
 
-def lateral_neighbour_counts(spatial_shape, device=None, dtype=None):
-    """How many lateral neighbours each (y, x) position has.
+def _add_neighbours(dst, src, axis, weight):
+    """Add `weight` times each neighbour along `axis` of `src` into `dst`.
 
-    4 inside, 3 along an edge, 2 in a corner. Built by shifting a plane of
-    ones, so a single row or a single column needs no special case. Never
-    returns 0, so it is safe to divide by.
+    Both arrays are (n_components, nz, ny, nx), so `axis` is 1, 2 or 3. The
+    two narrow views are one position apart, and that offset is the shift. A
+    face has no neighbour outside the array, so nothing is added there.
+    """
+    if not weight:
+        return
+    n = src.shape[axis]
+    torch.narrow(dst, axis, 1, n - 1).add_(
+        weight * torch.narrow(src, axis, 0, n - 1))
+    torch.narrow(dst, axis, 0, n - 1).add_(
+        weight * torch.narrow(src, axis, 1, n - 1))
+
+
+def lateral_neighbour_counts(spatial_shape, weights=(0.0, 1.0, 1.0),
+                             device=None, dtype=None):
+    """The divisor for lateral_neighbour_mean, one value per position.
+
+    `weights` is (wz, wy, wx). Each present neighbour along an axis adds that
+    axis weight. A missing neighbour at a face adds nothing, so its weight
+    goes to the neighbours that are present. Never returns 0, so it is safe
+    to divide by.
+
+    The result is (1, 1, ny, nx) when wz is 0, and (1, nz, ny, nx) otherwise.
+    Both broadcast against (n_components, nz, ny, nx).
 
     Computed once, outside the iteration loop.
     """
-    ny, nx = spatial_shape[1], spatial_shape[2]
-    o = torch.ones((1, 1, ny, nx), device=device, dtype=dtype)
+    nz, ny, nx = spatial_shape[0], spatial_shape[1], spatial_shape[2]
+    o = torch.ones((1, nz if weights[0] else 1, ny, nx),
+                   device=device, dtype=dtype)
     c = torch.zeros_like(o)
-    c[..., 1:, :] += o[..., :-1, :]
-    c[..., :-1, :] += o[..., 1:, :]
-    c[..., :, 1:] += o[..., :, :-1]
-    c[..., :, :-1] += o[..., :, 1:]
-    return torch.clamp(c, min=1.0)
+    for axis, weight in enumerate(weights, start=1):
+        _add_neighbours(c, o, axis, weight)
+    return torch.clamp(c, min=1e-12)
 
 
 def lateral_neighbour_mean(x, counts):

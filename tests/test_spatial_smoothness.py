@@ -34,8 +34,16 @@ def test_counts_are_4_inside_3_on_an_edge_2_in_a_corner():
 
 
 def test_counts_never_reach_zero():
-    """A single voxel plane has no neighbours, but must still be safe to divide by."""
-    assert counts_of((3, 1, 1))[0, 0, 0, 0] == 1.0
+    """A single voxel plane has no neighbours, but must still be safe to divide by.
+
+    The floor cannot be 1.0. A weight vector such as [0, 0.025, 0.025] gives an
+    interior count of 0.1, and a floor of 1.0 would silently rescale it. The floor
+    is only there to stop a division by zero, and the numerator is 0 there too.
+    """
+    c = counts_of((3, 1, 1))
+    assert float(c[0, 0, 0, 0]) > 0.0
+    x = torch.ones((1, 3, 1, 1))
+    assert float(lateral_neighbour_mean(x, c).abs().max()) == 0.0
 
 
 def test_a_single_hot_voxel_spreads_to_its_4_neighbours():
