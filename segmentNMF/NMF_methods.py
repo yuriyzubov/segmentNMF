@@ -380,6 +380,42 @@ STEP_SIZE_NORMS = ('sum_of_squares', 'sum')
 NORM_FLOOR = 1e-6
 
 
+def parse_spatial_smoothness(value):
+    """Read spatial_smoothness as (step, (wz, wy, wx)).
+
+    A sequence [z, y, x] is the pull strength along each axis. The step is
+    their sum. Only the ratios matter as weights, so they are divided by the
+    largest one here.
+
+    A scalar L is the same as [L, L, L]: step 3 * L, and equal weights. To keep
+    the smoothing lateral, put 0 in the z slot.
+
+    None, 0, and a vector of zeros all mean "no smoothing" and give step 0.
+
+    >>> parse_spatial_smoothness([0, 0.01, 0.01])   # lateral only
+    (0.02, (0.0, 1.0, 1.0))
+    >>> parse_spatial_smoothness(0.01)              # all 3 axes
+    (0.03, (1.0, 1.0, 1.0))
+    >>> parse_spatial_smoothness(None)              # off
+    (0.0, (1.0, 1.0, 1.0))
+    """
+    if value is None:
+        return 0.0, (1.0, 1.0, 1.0)
+    if np.isscalar(value):
+        value = (value, value, value)
+    w = tuple(float(v) for v in value)
+    if len(w) != 3:
+        raise ValueError('spatial_smoothness must be a scalar or 3 values '
+                         '[z, y, x], got {}'.format(value))
+    if any(v < 0.0 for v in w):
+        raise ValueError('spatial_smoothness values must not be negative, '
+                         'got {}'.format(value))
+    top = max(w)
+    if top == 0.0:
+        return 0.0, (1.0, 1.0, 1.0)
+    return sum(w), tuple(v / top for v in w)
+
+
 def lateral_neighbour_counts(spatial_shape, device=None, dtype=None):
     """How many lateral neighbours each (y, x) position has.
 

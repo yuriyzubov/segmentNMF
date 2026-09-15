@@ -16,7 +16,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from segmentNMF.NMF_methods import (lateral_neighbour_counts,  # noqa: E402
-                                    lateral_neighbour_mean, nmf_pytorch)
+                                    lateral_neighbour_mean, nmf_pytorch,
+                                    parse_spatial_smoothness)
 
 
 def counts_of(shape):
@@ -156,6 +157,23 @@ def test_b_blocks_the_pull():
                           spatial_smoothness=0.5, spatial_shape=SHAPE,
                           **RUN_KW)
     np.testing.assert_allclose(S, np.clip(p["S_init"], 0.0, 1.0), atol=1e-6)
+
+
+def test_parse_reads_a_scalar_and_a_vector():
+    # a scalar applies to all 3 axes, so the step is 3 times it
+    assert parse_spatial_smoothness(0.05) == (pytest.approx(0.15),
+                                              (1.0, 1.0, 1.0))
+    assert parse_spatial_smoothness(None)[0] == 0.0
+    step, w = parse_spatial_smoothness([0.01, 0.02, 0.02])
+    assert step == pytest.approx(0.05)
+    assert w == (0.5, 1.0, 1.0)                 # divided by the largest
+    # a scalar means all 3 axes, so lateral only must be written out in full
+    assert parse_spatial_smoothness([0.0, 0.025, 0.025]) == (0.05,
+                                                             (0.0, 1.0, 1.0))
+    assert parse_spatial_smoothness([0.0, 0.0, 0.0])[0] == 0.0
+    for bad in ([0.1, 0.1], [0.0, -0.1, 0.1]):
+        with pytest.raises(ValueError):
+            parse_spatial_smoothness(bad)
 
 
 if __name__ == "__main__":
