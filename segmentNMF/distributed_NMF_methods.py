@@ -132,11 +132,14 @@ def distributed_nmf(
         component, so a dim segment cannot be erased. A useful starting value
         is 0.05.
 
-    spatial_smoothness : float (default: None)
-        Passed to nmf_pytorch. Moves each spatial weight this fraction of the
-        way toward the mean of its lateral neighbours, once per iteration, and
-        then spatial_threshold cuts. None or 0 disables it. Requires
-        use_gpu=True, because only the pytorch nmf implements it.
+    spatial_smoothness : float or [z, y, x] (default: None)
+        Passed to nmf_pytorch. Moves each spatial weight toward the mean of
+        its neighbours, once per iteration, and then spatial_threshold cuts.
+        None or 0 disables it. Requires use_gpu=True, because only the pytorch
+        nmf implements it.
+
+        Three numbers give the pull along each axis. One number L is the same
+        as [L, L, L]. Put 0 in the z slot to keep the smoothing lateral.
 
         This repairs the damage spatial_threshold does on its own. The threshold
         decides one voxel at a time, so it cuts a smooth halo into fragments.
