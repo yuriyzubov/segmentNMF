@@ -10,6 +10,49 @@ from segmentNMF.neighborhood import neighborhood_by_weights
 from segmentNMF.NMF_methods import nmf, nmf_pytorch
 
 
+def as_box(box):
+    """Normalize a box to a tuple of slices with integer start and stop.
+
+    Accepts slices or (start, stop) pairs, one per axis.
+    """
+    out = []
+    for axis, item in enumerate(box):
+        start, stop = (item.start, item.stop) if isinstance(item, slice) else item
+        if start is None or stop is None:
+            raise ValueError('core_box needs an explicit start and stop on '
+                             'every axis, got {} on axis {}'.format(item, axis))
+        out.append(slice(int(start), int(stop)))
+    return tuple(out)
+
+
+def filter_block_seeds(segment_ids, boxes, core_box):
+    """Keep the cells whose bounding box centre falls inside core_box.
+
+    A cell that is left out here stays in the segments array, and still takes
+    part in the fit. It only loses its output row.
+
+    `segment_ids[i]` must describe `boxes[i]`, so both lists are filtered
+    together. Returns both unchanged when core_box is None.
+    """
+    if core_box is None:
+        return segment_ids, boxes
+    if len(segment_ids) != len(boxes):
+        raise ValueError('segment_ids and boxes disagree: {} vs {}'
+                         .format(len(segment_ids), len(boxes)))
+    core = as_box(core_box)
+    if boxes and len(core) != len(boxes[0]):
+        raise ValueError('core_box has {} axes, but the segments array has {}'
+                         .format(len(core), len(boxes[0])))
+    pairs = []
+    for s, b in zip(segment_ids, boxes):
+        centre = [(x.start + x.stop) / 2.0 for x in b]
+        if all(c.start <= v < c.stop for c, v in zip(core, centre)):
+            pairs.append((s, b))
+    if not pairs:
+        raise ValueError('core_box holds the centre of no segment')
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
 def distributed_nmf(
     time_series_zarr,
     segments,
