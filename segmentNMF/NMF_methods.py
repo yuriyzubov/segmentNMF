@@ -210,7 +210,9 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
         norm = np.sum(H[:n_components], axis=1)[None, :]
         norm[norm == 0] = 1
         S_step_size = S_lr / norm
-        S_gradient *= S_step_size * B
+        # B gains a column when the noise component is on, and the gradient
+        # does not. The step is only ever taken on the fitted components.
+        S_gradient *= S_step_size * B[:, :n_components]
         S[:, :n_components] += S_gradient
         S = np.maximum(0, S)
         S = np.minimum(1, S)  # we want amplitude in temporal not spatial components
