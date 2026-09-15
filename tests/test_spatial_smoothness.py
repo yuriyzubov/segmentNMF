@@ -5,9 +5,10 @@ voxel beside it. Without it, spatial_threshold cuts a smooth halo into many
 small pieces, one voxel at a time. The pieces sit at the same distance from the
 seed as the legitimate halo, so a neighbourhood radius cannot remove them.
 
-Two properties matter most, and each has a test below:
+Three properties matter most, and each has a test below:
   * with the term off, nothing changes at all;
-  * the term is LATERAL, so two z planes never mix.
+  * a z weight of 0 keeps the planes apart, and a z weight above 0 mixes them;
+  * a missing neighbour at a face gives its weight to the neighbours present.
 """
 
 import numpy as np
@@ -165,6 +166,19 @@ def test_b_blocks_the_pull():
                           spatial_smoothness=0.5, spatial_shape=SHAPE,
                           **RUN_KW)
     np.testing.assert_allclose(S, np.clip(p["S_init"], 0.0, 1.0), atol=1e-6)
+
+
+def test_a_z_weight_above_zero_couples_the_planes():
+    """The lateral only case must not mix planes, and the vector case must."""
+    x = torch.zeros((1, 2, 3, 3))
+    x[0, 0] = 1.0
+    w = (0.25, 1.0, 1.0)
+    avg = lateral_neighbour_mean(
+        x, lateral_neighbour_counts((2, 3, 3), weights=w, dtype=x.dtype),
+        weights=w)[0]
+    assert float(avg[1].abs().max()) > 0.0, "plane 1 must see plane 0"
+    # plane 1 centre: only neighbour is plane 0 at weight 0.25, of 4 + 0.25
+    assert float(avg[1, 1, 1]) == pytest.approx(0.25 / 4.25)
 
 
 def test_parse_reads_a_scalar_and_a_vector():

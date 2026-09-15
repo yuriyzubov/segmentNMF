@@ -455,21 +455,19 @@ def lateral_neighbour_counts(spatial_shape, weights=(0.0, 1.0, 1.0),
     return torch.clamp(c, min=1e-12)
 
 
-def lateral_neighbour_mean(x, counts):
-    """The mean of each voxel's lateral neighbours, excluding the voxel itself.
+def lateral_neighbour_mean(x, counts, weights=(0.0, 1.0, 1.0)):
+    """The weighted mean of a voxel's neighbours, excluding the voxel itself.
 
-    `x` is (n_components, nz, ny, nx). `counts` comes from
-    lateral_neighbour_counts for the same shape.
+    `x` is (n_components, nz, ny, nx). `counts` must come from
+    lateral_neighbour_counts for the same shape AND the same `weights`.
 
-    LATERAL ONLY, on purpose. A z step is often much longer than a lateral
-    step. A z neighbour is then much farther away, so mixing over z would join
-    cells that sit in different planes.
+    `weights` is (wz, wy, wx). A z step is often much longer than a lateral
+    step, and wz must then be smaller than wy and wx. At wz 0 nothing links
+    the planes, and each plane is fitted on its own.
     """
     s = torch.zeros_like(x)
-    s[:, :, 1:, :] += x[:, :, :-1, :]
-    s[:, :, :-1, :] += x[:, :, 1:, :]
-    s[:, :, :, 1:] += x[:, :, :, :-1]
-    s[:, :, :, :-1] += x[:, :, :, 1:]
+    for axis, weight in enumerate(weights, start=1):
+        _add_neighbours(s, x, axis, weight)
     return s / counts
 
 
