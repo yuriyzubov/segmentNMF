@@ -187,16 +187,13 @@ def objective_settled(objectives, i, rtol, window, min_iterations):
 def footprint_settled(nnz_history, rtol):
     """True once the number of surviving spatial voxels has stopped changing.
 
-    The objective is not enough on its own. It goes flat as soon as the fit is
-    good enough, but the footprint keeps shrinking for thousands of iterations
-    after that. The reason was measured on crop9: a voxel is deleted only when
-    its OWN weight decays past the threshold. The threshold itself never moves,
-    because S is clipped at 1 and every component's peak sits at 1. So voxels
-    keep dropping out one by one while the objective stands still.
-
-    Numbers from that measurement, at spatial_threshold 0.45: the objective rule
-    fired at iteration 250, where the footprint was still 16 percent larger than
-    its final size. It reached its final size near 1200.
+    The reconstruction error ||V - S @ H|| is not enough on its own. It goes
+    flat as soon as the fit is good, but the footprint keeps shrinking long
+    after that. A voxel is deleted only when its OWN weight decays past
+    spatial_threshold, and that threshold never moves, because S is clipped at
+    1 and every component's peak sits at 1. So voxels keep dropping out one by
+    one while the error stands still. A run stopped on the error alone can
+    leave a footprint well above its final size.
 
     `nnz_history` must be sampled on a fixed interval, so that two neighbouring
     entries are always the same number of iterations apart.
