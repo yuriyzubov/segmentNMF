@@ -371,6 +371,14 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
 # least squares step, so each choice needs its own H_lr and S_lr.
 STEP_SIZE_NORMS = ('sum_of_squares', 'sum')
 
+# Smallest value allowed as a step-size denominator. An exact zero test, such
+# as `norm[norm == 0] = 1`, does not catch a subnormal sum. A component whose
+# trace drains toward zero passes through that range. Torch flushes a subnormal
+# to zero inside the division and returns infinity. The infinity meets a zero
+# gradient entry, and 0 * inf is NaN, which spreads to every value in the
+# block. 1e-6 sits far above the subnormal range and far below a live component.
+NORM_FLOOR = 1e-6
+
 
 def lateral_neighbour_counts(spatial_shape, device=None, dtype=None):
     """How many lateral neighbours each (y, x) position has.
@@ -563,7 +571,7 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         # Update H matrix with dynamically estimated step size
         H_gradient = S.T @ (V - S @ H)
         norm = torch.sum(S * S if square_norm else S, dim=0)[:, None]
-        norm[norm == 0] = 1
+        norm = torch.clamp(norm, min=NORM_FLOOR)
         H_step_size = H_lr / norm
         H_gradient *= H_step_size
         H += H_gradient
@@ -572,7 +580,7 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         # Update S matrix with spatial constraint
         S_gradient = (V - S @ H) @ H.T
         norm = torch.sum(H * H if square_norm else H, dim=1)[None, :]
-        norm[norm == 0] = 1
+        norm = torch.clamp(norm, min=NORM_FLOOR)
         S_step_size = S_lr / norm
         S_gradient *= S_step_size * B
         S += S_gradient
