@@ -494,7 +494,7 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
                 objective_threshold: float = None, min_iterations: int = 50,
                 spatial_threshold: float = None, objective_rtol: float = 1e-4,
                 objective_window: int = 50, footprint_rtol: float = 1e-3,
-                footprint_window: int = 100, spatial_smoothness: float = None,
+                footprint_window: int = 100, spatial_smoothness=None,
                 spatial_shape=None):
 
     """Compute NMF using gradient descent
@@ -535,9 +535,14 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         spatial_threshold: Zero out spatial values below this fraction of their own component's
             peak, once per iteration. Bounds how far a footprint can spread when B never reaches
             zero. None disables it (default: None).
-        spatial_smoothness: Move each spatial weight this fraction of the way toward the
-            mean of its LATERAL neighbours, once per iteration. 0 or None disables it
-            (default: None). Requires spatial_shape.
+        spatial_smoothness: A scalar, or 3 values [z, y, x]. Move each spatial weight
+            toward the mean of its neighbours, once per iteration. 0 or None disables
+            it (default: None). Requires spatial_shape.
+
+            A vector gives the pull strength along each axis, and the step is their
+            sum. A scalar L is the same as [L, L, L]. To keep the smoothing lateral,
+            put 0 in the z slot. Give z a small weight when one z step is much larger
+            than one lateral step, or the smoothing joins cells in different planes.
 
             WHY. Nothing else in the objective couples a voxel to the voxel beside it,
             so the fit is free to delete single voxels out of a smooth patch. That
@@ -545,11 +550,11 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
             distance from the seed as the legitimate halo, so a neighbourhood radius
             cannot separate them. They ARE the halo, cut apart by spatial_threshold.
 
-            This term is the force that the gradient of a lateral roughness penalty
-            gives, sum over lateral neighbour pairs of (S[a] - S[b])**2, but taken with
-            a step of its own instead of the data step. That keeps the value readable:
-            0.1 means "move 10 percent of the way to the local mean each iteration".
-            It is scaled by B, so it cannot push a footprint outward where B is small.
+            This term is the force that the gradient of a roughness penalty gives, sum
+            over neighbour pairs of (S[a] - S[b])**2, but taken with a step of its own
+            instead of the data step. That keeps the value readable: 0.1 moves a
+            weight 10 percent of the way to the local mean each iteration. It is
+            scaled by B, so it cannot push a footprint outward where B is small.
 
             It runs AFTER the data update and BEFORE spatial_threshold, so a voxel held
             up by its neighbours survives the threshold.
@@ -602,9 +607,10 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
     nnz_history = []
     objective_done = False
 
-    # lateral smoothing, prepared once
+    # smoothing, prepared once
     counts = None
-    if spatial_smoothness:
+    smooth_step, smooth_w = parse_spatial_smoothness(spatial_smoothness)
+    if smooth_step:
         if spatial_shape is None:
             raise ValueError('spatial_smoothness requires spatial_shape')
         spatial_shape = tuple(int(v) for v in spatial_shape)
@@ -615,8 +621,8 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         if n_spatial != S.shape[0]:
             raise ValueError('spatial_shape {} holds {} voxels, but S has {}'
                              .format(spatial_shape, n_spatial, S.shape[0]))
-        counts = lateral_neighbour_counts(spatial_shape, device=device,
-                                          dtype=S.dtype)
+        counts = lateral_neighbour_counts(spatial_shape, weights=smooth_w,
+                                          device=device, dtype=S.dtype)
 
     print('Run gradient NMF | max iterations: {}'.format(num_iterations))
     # Perform projected gradient iterations
@@ -641,15 +647,16 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         S = torch.maximum(S, torch.Tensor([0]).to(S.device))
         S = torch.minimum(S, torch.Tensor([1]).to(S.device))  # we want amplitude in temporal not spatial components
 
-        # Pull each weight toward the mean of its lateral neighbours. This runs
-        # before the threshold on purpose: a voxel held up by its neighbours
-        # then survives the cut, and an isolated speck is pushed down into it.
-        if spatial_smoothness:
+        # Pull each weight toward the mean of its neighbours. This runs before
+        # the threshold on purpose: a voxel held up by its neighbours then
+        # survives the cut, and an isolated speck is pushed down into it.
+        if smooth_step:
             n_comp = S.shape[1]
             avg = lateral_neighbour_mean(
-                S.T.reshape((n_comp,) + spatial_shape), counts)
+                S.T.reshape((n_comp,) + spatial_shape), counts,
+                weights=smooth_w)
             avg = avg.reshape(n_comp, -1).T
-            S = S + spatial_smoothness * B * (avg - S)
+            S = S + smooth_step * B * (avg - S)
             S = torch.clamp(S, 0.0, 1.0)
 
         # per-component threshold, so a dim component cannot be erased

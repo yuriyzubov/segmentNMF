@@ -168,6 +168,31 @@ def test_b_blocks_the_pull():
     np.testing.assert_allclose(S, np.clip(p["S_init"], 0.0, 1.0), atol=1e-6)
 
 
+def test_a_scalar_equals_the_same_value_on_all_three_axes():
+    """A scalar L must be the same setting as [L, L, L], bit for bit.
+
+    Only the ratios of the weights matter, because the mean divides by their sum.
+    """
+    p = toy_problem()
+    a, _, _ = nmf_pytorch(p["V"], p["S_init"], p["H_init"], p["B"],
+                          spatial_smoothness=0.2, spatial_shape=SHAPE, **RUN_KW)
+    b, _, _ = nmf_pytorch(p["V"], p["S_init"], p["H_init"], p["B"],
+                          spatial_smoothness=[0.2, 0.2, 0.2],
+                          spatial_shape=SHAPE, **RUN_KW)
+    np.testing.assert_array_equal(a, b)
+
+
+def test_a_scalar_is_not_lateral_only():
+    """A scalar pulls along z too, so it must differ from [0, L / 2, L / 2]."""
+    p = toy_problem()
+    a, _, _ = nmf_pytorch(p["V"], p["S_init"], p["H_init"], p["B"],
+                          spatial_smoothness=0.2, spatial_shape=SHAPE, **RUN_KW)
+    b, _, _ = nmf_pytorch(p["V"], p["S_init"], p["H_init"], p["B"],
+                          spatial_smoothness=[0.0, 0.1, 0.1],
+                          spatial_shape=SHAPE, **RUN_KW)
+    assert np.abs(a - b).max() > 1e-4
+
+
 def test_a_z_weight_above_zero_couples_the_planes():
     """The lateral only case must not mix planes, and the vector case must."""
     x = torch.zeros((1, 2, 3, 3))
