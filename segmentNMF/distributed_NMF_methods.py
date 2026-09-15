@@ -63,6 +63,7 @@ def distributed_nmf(
     block_radius=4.0,
     time_series_baseline=None,
     neighborhood_sigma=2.0,
+    core_box=None,
     temporary_directory=None,
     use_gpu=False,
     n_output_segments=None,
@@ -118,6 +119,24 @@ def distributed_nmf(
         np.exp( -dist / neighborhood_sigma ) where dist is the distance of
         a location in the spatial component from the boundary of the given
         segment. Larger values allow spatial components to grow more.
+
+    core_box : sequence of slice or (start, stop), one per axis (default: None)
+        The part of `segments` this call is responsible for. Only the segments
+        whose bounding box centre falls inside the core_box get an output row.
+        None gives every segment a row.
+
+        A segment outside the core_box stays in the array and takes part in
+        the fit, but its trace is not written. Its row stays NaN.
+
+        Use core_box on a padded tile, and keep the padding cells in the
+        array. If you remove a cell, the cells next to it take over its
+        voxels, and their traces pick up its activity.
+
+        A padding cell gets no row because this tile does not hold all of its
+        neighbours. The next tile holds them, and writes its trace.
+
+        Rows are indexed by segment id, so n_output_segments must cover every
+        id in the array.
 
     temporary_directory : string (default: None)
         Temporary files are created during nmf. The temporary files will be
@@ -195,6 +214,8 @@ def distributed_nmf(
         if np.any(sizes > 40): bad_box_ids.append(iii)
     segment_ids = [x for i, x in enumerate(segment_ids) if i not in bad_box_ids]
     boxes = [x for i, x in enumerate(boxes) if i not in bad_box_ids]
+
+    segment_ids, boxes = filter_block_seeds(segment_ids, boxes, core_box)
 
     # get centers, get neighbors
     centers = [[(x.start + x.stop)/2. for x in slc] for slc in boxes]
