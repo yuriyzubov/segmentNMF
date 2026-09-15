@@ -190,8 +190,17 @@ def test_footprint_settled_reads_a_relative_change():
 # so such a test would measure the learning rates, not the stopping rule.
 
 
-def test_pytorch_stops_at_the_same_iteration():
-    """Both implementations share one rule, so both must stop on the same step.
+def test_pytorch_stops_early_by_the_same_rule():
+    """Both implementations obey the rule, but they no longer share a path.
+
+    This test used to assert len(a) == len(b). That held while both step sizes
+    divided by the plain sum. nmf_pytorch now defaults to a sum of squares, and
+    the numpy `nmf` always uses the plain sum, so the two take different steps
+    and cannot stop on the same iteration. An equal iteration count was never
+    part of the rule.
+
+    The assertion is now what the rule does promise. Each run must stop before
+    the maximum, on the relative drop, and neither may run away.
 
     nmf_pytorch uses the GPU when one is present. The problem here is 60 by 40,
     so the run costs almost nothing on a shared card.
@@ -206,7 +215,16 @@ def test_pytorch_stops_at_the_same_iteration():
     q = toy_problem()
     kw.pop("estimate_noise_component")       # nmf_pytorch has no such option
     _, _, b = nmf_pytorch(q["V"], q["S_init"], q["H_init"], q["B"], **kw)
-    assert len(a) == len(b)
+
+    n_max = NMF_KW["num_iterations"]
+    for name, curve in (("numpy", a), ("torch", b)):
+        assert len(curve) < n_max, f"{name} never settled"
+        # the rule is tested only every `window` iterations, so the stop must
+        # land on a multiple of the window
+        assert len(curve) % 25 == 0, f"{name} stopped off the window grid"
+        obj = np.asarray([float(o) for o in curve])
+        assert np.isfinite(obj).all(), f"{name} went non finite"
+        assert obj[-1] < obj[0], f"{name} did not reduce the objective"
 
 
 def test_objective_threshold_is_accepted_and_ignored():
