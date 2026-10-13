@@ -488,6 +488,16 @@ def frobenius_norm_pytorch(V, S, H):
     return objective
 
 
+def smooth_in_time(H, a, freq):
+    """(I + a L)^-1 H row by row: L the 1D Laplacian along time with mirror
+    boundaries, a of shape (n_rows, 1), freq L's eigenvalues for the rfft of the
+    mirrored rows. The proximal step of (a / 2) * sum_t (H[t+1] - H[t])^2."""
+    n_t = H.shape[1]
+    ext = torch.cat([H, torch.flip(H, dims=[1])], dim=1)
+    F = torch.fft.rfft(ext, dim=1) / (1 + a * freq)
+    return torch.fft.irfft(F, n=2 * n_t, dim=1)[:, :n_t]
+
+
 def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr: float = 1e-1,
                 S_lr: float = 1e-1, step_size_norm: str = 'sum_of_squares',
                 objective_threshold: float = None, min_iterations: int = 50,
