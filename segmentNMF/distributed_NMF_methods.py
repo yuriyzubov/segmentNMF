@@ -1,4 +1,4 @@
-import os, tempfile
+import os, re, tempfile
 import numpy as np
 import zarr
 import time
@@ -30,6 +30,18 @@ def _pin_worker_gpu():
     except (ImportError, ValueError, TypeError):
         k = os.getpid()
     torch.cuda.set_device(k % n)
+
+
+_ALLOCATION = re.compile(r'Tried to allocate ([\d.]+) (B|KiB|MiB|GiB|TiB)')
+_UNITS = ('B', 'KiB', 'MiB', 'GiB', 'TiB')
+
+
+def _requested_bytes(error):
+    """The size of the allocation that failed, from the out-of-memory message (0 if absent)."""
+    m = _ALLOCATION.search(str(error))
+    if m is None:
+        return 0
+    return int(float(m.group(1)) * 1024 ** _UNITS.index(m.group(2)))
 
 
 def as_box(box):
