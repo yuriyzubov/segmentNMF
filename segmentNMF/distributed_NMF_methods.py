@@ -32,6 +32,9 @@ def _pin_worker_gpu():
     torch.cuda.set_device(k % n)
 
 
+GPU_WAIT_POLL_S = 30      # how often a block that ran out of GPU memory checks the card
+GPU_WAIT_MAX_S = 3600     # how long one block waits in all before it gives up
+
 _ALLOCATION = re.compile(r'Tried to allocate ([\d.]+) (B|KiB|MiB|GiB|TiB)')
 _UNITS = ('B', 'KiB', 'MiB', 'GiB', 'TiB')
 
@@ -42,6 +45,57 @@ def _requested_bytes(error):
     if m is None:
         return 0
     return int(float(m.group(1)) * 1024 ** _UNITS.index(m.group(2)))
+
+
+def _fit_waiting_for_gpu(fit, poll_s=GPU_WAIT_POLL_S, max_wait_s=GPU_WAIT_MAX_S,
+                         sleep=time.sleep):
+    """Return fit(). When the GPU runs out of memory, wait for memory and run fit() again.
+
+    Several dask workers can share one GPU. A block can then run out of memory only
+    because the other workers hold the memory at that moment. Such a block does not
+    fail. It frees its own memory and waits until the card has as much free memory as
+    the failed try needed: its peak allocation plus the allocation that failed. Then
+    it runs its fit again from the beginning, with the same inputs, so the result is
+    the same as without the wait. It checks the card every poll_s seconds.
+
+    The error is raised as before:
+      - at once, when the failed try needed more than the whole card. Waiting
+        cannot help such a block;
+      - when the block has waited max_wait_s seconds in all.
+
+    PyTorch keeps the memory that a process frees in a cache for that process, where
+    the other workers cannot use it. So the cache is released after every try, also
+    after a fit that ends without an error."""
+    import gc
+    import torch
+    waited = 0
+    while True:
+        torch.cuda.reset_peak_memory_stats()
+        try:
+            return fit()
+        except torch.OutOfMemoryError as error:
+            need = torch.cuda.max_memory_allocated() + _requested_bytes(error)
+            message = str(error)
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info()
+        if need > total:
+            raise torch.OutOfMemoryError(
+                'the block needs {:.1f} GiB, more than the {:.1f} GiB of the whole GPU: '
+                'waiting cannot help. {}'.format(need / 2**30, total / 2**30, message))
+        while True:
+            if waited >= max_wait_s:
+                raise torch.OutOfMemoryError(
+                    'waited {} s for {:.1f} GiB of free GPU memory, {:.1f} GiB free. {}'
+                    .format(waited, need / 2**30, free / 2**30, message))
+            sleep(poll_s)
+            waited += poll_s
+            free, total = torch.cuda.mem_get_info()
+            if free >= need:
+                break
+        print('GPU out of memory: waited {} s in all, {:.1f} GiB free for {:.1f} GiB, '
+              'running the fit again'.format(waited, free / 2**30, need / 2**30), flush=True)
 
 
 def as_box(box):
