@@ -510,10 +510,10 @@ def distributed_nmf(
         # run nmf
         if use_gpu:
             _pin_worker_gpu()
-            S_res, H_res, objectives = nmf_pytorch(
+            S_res, H_res, objectives = _fit_waiting_for_gpu(lambda: nmf_pytorch(
                 V, S, H, B,
                 **kwargs,
-            )
+            ))
         else:
             S_res, H_res, objectives = nmf(
                 V, S, H, B,
