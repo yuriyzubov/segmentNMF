@@ -5,9 +5,9 @@ import copy
 
 from scipy.stats import entropy
 
-from zarr.indexing import BasicIndexer
-from numcodecs import Blosc
-from distributed import Lock
+# from zarr.indexing import BasicIndexer  # removed in zarr v3, no replacement; see chunk_locked block below
+from zarr.codecs import BloscCodec
+# from distributed import Lock  # only used by the disabled chunk_locked block below
 
 from scipy.ndimage import binary_dilation as binary_dilation_scipy
 
@@ -51,27 +51,22 @@ def file_handler(file_path):
         ValueError: If the file type is unsupported.
 
     """
-    file_extension = file_path.split('.')[-1].lower()
+    path_lower = file_path.lower().rstrip('/')
 
-    if file_extension == 'npy':
-        # Load numpy file and create temporary Zarr array
+    # Detect zarr first via substring -- supports paths into multi-scale
+    # groups like "/.../foo.zarr/s0" where the literal extension check fails.
+    if '.zarr' in path_lower:
+        return zarr.open(file_path, mode='r')
+
+    if path_lower.endswith('.npy'):
         data = np.load(file_path)
-        zarr_array = create_temp_zarr(data)
-        return zarr_array
+        return create_temp_zarr(data)
 
-    elif file_extension == 'zarr':
-        # Load zarr file (lazy loading)
-        data = zarr.open(file_path, mode='r')
-        return data
+    if path_lower.endswith('.nrrd'):
+        data, _ = nrrd.read(file_path)
+        return create_temp_zarr(data)
 
-    elif file_extension == 'nrrd':
-        # Load nrrd file and create temporary Zarr array
-        data, header = nrrd.read(file_path)
-        zarr_array = create_temp_zarr(data)
-        return zarr_array
-
-    else:
-        raise ValueError(f"Unsupported file type: {file_extension}")
+    raise ValueError(f"Unsupported file type: {file_path}")
 
 
 def dilate_outer_layers(im, rad=[1, 1, 1], k: int = 1):
@@ -204,28 +199,31 @@ def create_zarr(path, shape, chunks, dtype, chunk_locked=False, client=None):
         zarr.core.Array: The Zarr array.
 
     """
-    compressor = Blosc(
-        cname='zstd', clevel=4, shuffle=Blosc.BITSHUFFLE,
+    compressor = BloscCodec(
+        cname='zstd', clevel=4, shuffle='bitshuffle',
     )
-    zarr_disk = zarr.open(
-        path, 'w',
+    zarr_disk = zarr.create_array(
+        path,
         shape=shape,
         chunks=chunks,
         dtype=dtype,
-        compressor=compressor,
+        compressors=compressor,
+        overwrite=True,
     )
 
     # this code is currently never used within CircuitSeeker
     # keeping it around in case a use case comes up
-    if chunk_locked:
-        indexer = BasicIndexer(slice(None), zarr_disk)
-        keys = (zarr_disk._chunk_key(idx.chunk_coords) for idx in indexer)
-        lock = {key: Lock(key, client=client) for key in keys}
-        lock['.zarray'] = Lock('.zarray', client=client)
-        zarr_disk = zarr.open(
-            store=zarr_disk.store, path=zarr_disk.path,
-            synchronizer=lock, mode='r+',
-        )
+    # Temporarily disabled for zarr v3: BasicIndexer/synchronizer= have no
+    # v3 equivalent (unported). Re-enable with a hand-rolled lock if needed.
+    # if chunk_locked:
+    #     indexer = BasicIndexer(slice(None), zarr_disk)
+    #     keys = (zarr_disk._chunk_key(idx.chunk_coords) for idx in indexer)
+    #     lock = {key: Lock(key, client=client) for key in keys}
+    #     lock['.zarray'] = Lock('.zarray', client=client)
+    #     zarr_disk = zarr.open(
+    #         store=zarr_disk.store, path=zarr_disk.path,
+    #         synchronizer=lock, mode='r+',
+    #     )
 
     return zarr_disk
 
