@@ -10,6 +10,28 @@ from segmentNMF.neighborhood import neighborhood_by_weights
 from segmentNMF.NMF_methods import nmf, nmf_pytorch
 
 
+def _pin_worker_gpu():
+    """Give each dask worker its own GPU when the job holds more than one.
+
+    nmf_pytorch puts its tensors on torch.device("cuda"), the current device,
+    which is GPU 0 unless set. With several GPUs in one job, every worker would
+    then share GPU 0. Here worker k takes GPU k mod n. Worker names of a local
+    cluster are 0, 1, 2, ...; any other name falls back to the process id.
+    With one visible GPU this does nothing, so single-GPU runs are unchanged.
+    """
+    import torch
+    n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n <= 1:
+        return
+    try:
+        from distributed import get_worker
+        name = get_worker().name
+        k = int(name)
+    except (ImportError, ValueError, TypeError):
+        k = os.getpid()
+    torch.cuda.set_device(k % n)
+
+
 def as_box(box):
     """Normalize a box to a tuple of slices with integer start and stop.
 
@@ -421,6 +443,7 @@ def distributed_nmf(
 
         # run nmf
         if use_gpu:
+            _pin_worker_gpu()
             S_res, H_res, objectives = nmf_pytorch(
                 V, S, H, B,
                 **kwargs,
