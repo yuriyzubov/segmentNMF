@@ -100,6 +100,7 @@ def distributed_nmf(
     time_series_baseline=None,
     neighborhood_sigma=2.0,
     core_box=None,
+    only_cells=None,
     temporary_directory=None,
     use_gpu=False,
     n_output_segments=None,
@@ -173,6 +174,16 @@ def distributed_nmf(
 
         Rows are indexed by segment id, so n_output_segments must cover every
         id in the array.
+
+    only_cells : sequence of int (default: None)
+        Segment ids to run. The block layout is computed from every seed, as
+        without this option, and then only the blocks that hold one of these
+        ids are run. Each of these cells therefore gets the same block, the
+        same crop and the same neighbours as in a full run. The other cells of
+        those blocks also get a row. Every other row stays NaN.
+
+        None runs every block. Each id must be a seed, that is, its box centre
+        must fall inside core_box.
 
     temporary_directory : string (default: None)
         Temporary files are created during nmf. The temporary files will be
@@ -320,6 +331,22 @@ def distributed_nmf(
 
     # convert segment union indices to segment ids
     segment_unions = [tuple(segment_ids[i] for i in x) for x in segment_unions]
+
+    # keep only the blocks that hold a requested cell. The layout above used
+    # every seed, so these blocks are the same as in a full run.
+    if only_cells is not None:
+        wanted = set(int(x) for x in only_cells)
+        seeds = set(int(x) for u in segment_unions for x in u)
+        missing = sorted(wanted - seeds)
+        if missing:
+            raise ValueError('only_cells holds ids that are not seeds of any '
+                             'block: {}'.format(missing))
+        keep = [i for i, u in enumerate(segment_unions)
+                if wanted & set(int(x) for x in u)]
+        print(f'only_cells: running {len(keep)} of {len(segment_unions)} blocks')
+        segment_unions = [segment_unions[i] for i in keep]
+        time_series_crops = [time_series_crops[i] for i in keep]
+        segments_crops = [segments_crops[i] for i in keep]
 
     # make tempfile if we need it
     A = not isinstance(segments, zarr.Array)
