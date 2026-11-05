@@ -253,6 +253,22 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
 # Pytorch-based implementation
 # ======================================================================================================================
 
+# THE TWO STEP SIZE DENOMINATORS
+#
+# A step size answers one question: how far must this component move to remove
+# the whole error? sum(S[:, c] ** 2) is the answer for a component that sits
+# alone, so a learning rate of 1 then moves it exactly onto the best value.
+#
+# Components that share voxels move at the same time. Each one still moves as
+# if it were alone, so the two moves add up and go too far. Use a rate below 1
+# when footprints overlap.
+#
+# 'sum' divides by the plain sum. The step is then the mean residual over the
+# footprint, weighted by S, and it stays in data units. It is larger than the
+# least squares step, so each choice needs its own H_lr and S_lr.
+STEP_SIZE_NORMS = ('sum_of_squares', 'sum')
+
+
 def frobenius_norm_pytorch(V, S, H):
     """Calculate the Frobenius norm objective.
 
@@ -272,7 +288,8 @@ def frobenius_norm_pytorch(V, S, H):
 
 
 def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr: float = 1e-1,
-                S_lr: float = 1e-1, objective_threshold: float = 1e-2, min_iterations: int = 50):
+                S_lr: float = 1e-1, step_size_norm: str = 'sum_of_squares',
+                objective_threshold: float = 1e-2, min_iterations: int = 50):
 
     """Compute NMF using gradient descent
 
@@ -286,12 +303,23 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         update_int: The interval at which to display progress updates (default: 10).
         H_lr: The learning rate for the H matrix (default: 1).
         S_lr: The learning rate for the S matrix (default: 1e-6).
+        step_size_norm: 'sum_of_squares' or 'sum', the denominator of both step
+            sizes (default: 'sum_of_squares'). It decides how the voxels of one
+            footprint combine into one step. 'sum' takes the mean residual over
+            the footprint, weighted by S, and stays in data units.
+            'sum_of_squares' takes the least squares step, which is exact for a
+            component that sits alone. Each choice needs its own H_lr and S_lr.
         objective_threshold: The stopping criterion for the objective (default: 1e-2).
         min_iterations: The minimum number of iterations to run the algorithm for (default: 50).
 
     Returns:
         A tuple of PyTorch tensors representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
     """
+
+    if step_size_norm not in STEP_SIZE_NORMS:
+        raise ValueError('step_size_norm must be one of {}, got {}'
+                         .format(STEP_SIZE_NORMS, step_size_norm))
+    square_norm = step_size_norm == 'sum_of_squares'
 
     # float32: inputs are uint16 data, and most GPUs run FP64 far slower
     V = torch.tensor(V, dtype=torch.float32)
@@ -325,7 +353,7 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
 
         # Update H matrix with dynamically estimated step size
         H_gradient = S.T @ (V - S @ H)
-        norm = torch.sum(S, dim=0)[:, None]
+        norm = torch.sum(S * S if square_norm else S, dim=0)[:, None]
         norm[norm == 0] = 1
         H_step_size = H_lr / norm
         H_gradient *= H_step_size
@@ -334,7 +362,7 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
 
         # Update S matrix with spatial constraint
         S_gradient = (V - S @ H) @ H.T
-        norm = torch.sum(H, dim=1)[None, :]
+        norm = torch.sum(H * H if square_norm else H, dim=1)[None, :]
         norm[norm == 0] = 1
         S_step_size = S_lr / norm
         S_gradient *= S_step_size * B
