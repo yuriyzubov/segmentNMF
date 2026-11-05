@@ -493,7 +493,8 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
                 objective_threshold: float = None, min_iterations: int = 50,
                 objective_rtol: float = 1e-4, objective_window: int = 50,
                 footprint_rtol: float = 1e-3, footprint_window: int = 100,
-                spatial_smoothness=None, spatial_shape=None):
+                spatial_smoothness=None, spatial_shape=None, S_max=None,
+                S_max_core=None):
 
     """Compute NMF using gradient descent
 
@@ -554,6 +555,18 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         spatial_shape: The (nz, ny, nx) shape of the spatial canvas, needed to find a
             voxel's neighbours. Its product must equal S_init.shape[0]. Only used when
             spatial_smoothness is on (default: None).
+        S_max, S_max_core: A per-voxel upper limit on each footprint, relative to its
+            own core, from neighborhood.max_light_per_voxel. Both shaped like S_init.
+            Every iteration, S[v, i] <= S_max[v, i] * m_i, where m_i is S[:, i]'s peak
+            over the voxels where S_max_core[:, i] is True. In the core region S_max
+            is 1, so the limit only binds outside it, where it is the blur tail. None
+            disables it (default: None).
+
+            WHY. Without it nothing stops a component from becoming bright on a
+            neighbour's core: a small or dim cell can lower the error by taking a
+            bright neighbour's light. Relative to m_i, because a footprint's scale
+            is free (the trace absorbs it), so a fixed limit could be dodged by
+            dimming the whole footprint.
 
     Returns:
         A tuple of PyTorch tensors representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
@@ -580,6 +593,15 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
     S = S_init.to(device)
     H = H_init.to(device)
     B = B.to(device)
+    zero = torch.zeros((), device=device, dtype=S.dtype)
+    if (S_max is None) != (S_max_core is None):
+        raise ValueError('S_max and S_max_core go together')
+    if S_max is not None:
+        S_max = torch.as_tensor(S_max, dtype=torch.float32).to(device)
+        S_max_core = torch.as_tensor(S_max_core, dtype=torch.bool).to(device)
+        if S_max.shape != S.shape or S_max_core.shape != S.shape:
+            raise ValueError('S_max and S_max_core must have the shape of S_init, '
+                             '{}'.format(tuple(S.shape)))
 
     objectives = []
     correlations = []
@@ -645,6 +667,11 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
             avg = avg.reshape(n_comp, -1).T
             S = S + smooth_step * B * (avg - S)
             S = torch.clamp(S, 0.0, 1.0)
+
+        # per-voxel limit, relative to the component's peak in its own core region
+        if S_max is not None:
+            m = torch.where(S_max_core, S, zero).amax(dim=0, keepdim=True)
+            S = torch.minimum(S, S_max * m)
 
         # Save gradient steps
         S_gradients.append(torch.mean(S_gradient).item())
