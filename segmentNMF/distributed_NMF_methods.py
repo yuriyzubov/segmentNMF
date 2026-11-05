@@ -6,7 +6,7 @@ import glob
 from ClusterWrap.decorator import cluster as cluster_decorator
 from scipy.ndimage import find_objects
 from scipy.spatial import cKDTree
-from segmentNMF.neighborhood import neighborhood_by_weights
+from segmentNMF.neighborhood import neighborhood_by_distance, neighborhood_by_weights
 from segmentNMF.NMF_methods import nmf, nmf_pytorch
 
 
@@ -164,7 +164,9 @@ def distributed_nmf(
     max_neighbor_distance=20.0,
     block_radius=4.0,
     time_series_baseline=None,
+    neighborhood='weights',
     neighborhood_sigma=2.0,
+    neighborhood_radius=None,
     core_box=None,
     only_cells=None,
     spatial_smoothness=None,
@@ -217,12 +219,34 @@ def distributed_nmf(
     time_series_baseline : float (default: None)
         A scalar baseline value to subtract from the time series. Ignored if None.
 
+    neighborhood : 'weights' or 'distance' (default: 'weights')
+        Which neighborhood matrix B constrains the spatial components.
+
+        'weights' uses neighborhood_by_weights: a smooth exponential falloff
+        that also accounts for sub-plane z position. It damps the growth rate
+        but never reaches zero, so a footprint can keep growing outward the
+        longer the fit runs, bounded only by the block crop. The result then
+        depends on the block size.
+
+        'distance' uses neighborhood_by_distance: exactly zero beyond
+        neighborhood_radius, so a footprint cannot grow past it however many
+        iterations run. Inside that radius it is binary, so growth runs at
+        full rate up to the boundary. It has no notion of sub-plane z
+        position.
+
     neighborhood_sigma : float (default: 2.0)
-        Spatial component learning rates are scaled by weights that enforce
-        the prior given structure. The weight function is:
-        np.exp( -dist / neighborhood_sigma ) where dist is the distance of
-        a location in the spatial component from the boundary of the given
-        segment. Larger values allow spatial components to grow more.
+        Sets the z weights of the starting spatial components. With
+        neighborhood='weights' it also sets the falloff: spatial component
+        learning rates are scaled by np.exp( -dist / neighborhood_sigma ),
+        where dist is the distance of a location in the spatial component
+        from the boundary of the given segment. Larger values allow spatial
+        components to grow more.
+
+    neighborhood_radius : float (default: None)
+        Required when neighborhood='distance', otherwise ignored. The hard
+        limit, in the units of time_series_spacing, on how far a spatial
+        component may extend past its segment. Not to be confused with
+        max_neighbor_distance, which groups cells into blocks.
 
     core_box : sequence of slice or (start, stop), one per axis (default: None)
         The part of `segments` this call is responsible for. Only the segments
@@ -315,6 +339,11 @@ def distributed_nmf(
         the `segments` array are NaN value for all T.
     """
 
+    if neighborhood not in ('weights', 'distance'):
+        raise ValueError("neighborhood must be 'weights' or 'distance', got "
+                         "{!r}".format(neighborhood))
+    if neighborhood == 'distance' and neighborhood_radius is None:
+        raise ValueError("neighborhood='distance' requires neighborhood_radius")
     if spatial_smoothness and not use_gpu:
         raise ValueError('spatial_smoothness requires use_gpu=True; only '
                          'nmf_pytorch has it')
@@ -542,11 +571,18 @@ def distributed_nmf(
             S[:, i] = comp.reshape(np.prod(ts[1:]))
 
         # format search neighborhoods
-        B = neighborhood_by_weights(
-            S, segments_shape=ts[1:],
-            sigma=neighborhood_sigma,
-            spacing=time_series_spacing,
-        )
+        if neighborhood == 'weights':
+            B = neighborhood_by_weights(
+                S, segments_shape=ts[1:],
+                sigma=neighborhood_sigma,
+                spacing=time_series_spacing,
+            )
+        else:
+            B = neighborhood_by_distance(
+                S, segments_shape=ts[1:],
+                max_dist=neighborhood_radius,
+                spacing=time_series_spacing,
+            )
 
         # format the temporal components
         H = np.zeros((n_labels, ts[0]), dtype=np.float32)
