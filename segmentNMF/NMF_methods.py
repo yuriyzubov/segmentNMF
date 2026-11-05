@@ -504,7 +504,7 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
                 objective_rtol: float = 1e-4, objective_window: int = 50,
                 footprint_rtol: float = 1e-3, footprint_window: int = 100,
                 spatial_smoothness=None, spatial_shape=None, S_max=None,
-                S_max_core=None):
+                S_max_core=None, temporal_smoothness=None):
 
     """Compute NMF using gradient descent
 
@@ -577,6 +577,27 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
             bright neighbour's light. Relative to m_i, because a footprint's scale
             is free (the trace absorbs it), so a fixed limit could be dodged by
             dimming the whole footprint.
+        temporal_smoothness: lam >= 0. Adds (lam / 2) * |S_i|^2 * sum_t (H[i, t+1] - H[i, t])^2
+            for every component to the objective. 0 or None disables it (default: None).
+
+            Weighted by |S_i|^2, the component's own data weight, so lam is unitless:
+            for a component that sits alone the result is its least-squares trace
+            filtered by 1 / (1 + lam * (2 - 2 cos w)), w the frequency in radians per
+            frame. lam = 1 cuts frame-to-frame (Nyquist) noise to 1/5 in amplitude and
+            a 6-frame period to 1/2.
+
+            WHY. Where two footprints overlap, the data pin the sum of the two traces
+            but only weakly their difference, so each frame's noise goes into the
+            difference: one trace up, the other down (zero-lag anticorrelation of close
+            pairs, near minus the footprint overlap). The difference has less data
+            weight, |S|^2 (1 - overlap), against the same penalty, so it is smoothed
+            more than the sum: about (1 + overlap) / (1 - overlap) times, 3x at 0.5.
+            Smoothing the traces afterwards cannot do this, it treats both alike.
+
+            Taken as a proximal step after each H gradient step (an FFT along time,
+            mirror boundaries), so it is stable at any lam and does not slow the
+            data step. Its cost: real changes faster than about one frame are
+            smoothed too. Check the recovery of a known signal.
 
     Returns:
         A tuple of PyTorch tensors representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
@@ -612,6 +633,16 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         if S_max.shape != S.shape or S_max_core.shape != S.shape:
             raise ValueError('S_max and S_max_core must have the shape of S_init, '
                              '{}'.format(tuple(S.shape)))
+
+    t_smooth = float(temporal_smoothness or 0.0)
+    if t_smooth < 0:
+        raise ValueError('temporal_smoothness must be >= 0, got {}'.format(temporal_smoothness))
+    if t_smooth:
+        # eigenvalues of the 1D Laplacian with mirror boundaries (rfft of the
+        # mirrored trace, length 2T)
+        n_t = H.shape[1]
+        k = torch.arange(n_t + 1, device=device, dtype=H.dtype)
+        t_freq = (2 - 2 * torch.cos(np.pi * k / n_t))[None, :]
 
     objectives = []
     correlations = []
@@ -655,6 +686,10 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         H_step_size = H_lr / norm
         H_gradient *= H_step_size
         H += H_gradient
+        # proximal step of the temporal penalty, same step size as the data step
+        if t_smooth:
+            H = smooth_in_time(H, H_step_size * t_smooth * torch.sum(S * S, dim=0)[:, None],
+                               t_freq)
         H = torch.maximum(H, torch.Tensor([0]).to(H.device))
 
         # Update S matrix with spatial constraint
