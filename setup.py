@@ -21,6 +21,7 @@ setuptools.setup(
         'dask[distributed]',
         'tqdm',
         'torch',
+        'numba',
     ],
     extras_require={
         'test': ['pytest'],
