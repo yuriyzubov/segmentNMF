@@ -7,7 +7,8 @@ from ClusterWrap.decorator import cluster as cluster_decorator
 from scipy.ndimage import find_objects
 from scipy.sparse import coo_matrix
 from scipy.spatial import cKDTree
-from segmentNMF.neighborhood import neighborhood_by_distance, neighborhood_by_weights
+from segmentNMF.neighborhood import (neighborhood_by_distance, neighborhood_by_weights,
+                                     max_light_per_voxel as build_max_light_per_voxel)
 from segmentNMF.NMF_methods import nmf, nmf_pytorch
 
 
@@ -171,6 +172,7 @@ def distributed_nmf(
     core_box=None,
     only_cells=None,
     spatial_smoothness=None,
+    max_light_per_voxel=None,
     temporary_directory=None,
     use_gpu=False,
     n_output_segments=None,
@@ -290,6 +292,16 @@ def distributed_nmf(
         nmf_pytorch also needs spatial_shape. That is supplied per block, so it
         is not a parameter here.
 
+    max_light_per_voxel : dict (default: None)
+        Keyword arguments of neighborhood.max_light_per_voxel (sigma_xy,
+        sigma_z, widen_xy, widen_z, core_level). Each block builds every
+        cell's per-voxel limit from its own segments crop, with the same plane
+        windows it builds S_init with, and nmf_pytorch keeps each footprint
+        under it, relative to the footprint's peak in its own core region. A
+        footprint may then be bright in its own (widened) mask, and elsewhere
+        only as bright as blur allows. None disables it. Requires
+        use_gpu=True.
+
     temporary_directory : string (default: None)
         Temporary files are created during nmf. The temporary files will be
         in their own folder within the `temporary_directory`. The default is the
@@ -361,6 +373,9 @@ def distributed_nmf(
         raise ValueError("neighborhood='distance' requires neighborhood_radius")
     if spatial_smoothness and not use_gpu:
         raise ValueError('spatial_smoothness requires use_gpu=True; only '
+                         'nmf_pytorch has it')
+    if max_light_per_voxel and not use_gpu:
+        raise ValueError('max_light_per_voxel requires use_gpu=True; only '
                          'nmf_pytorch has it')
 
     # get all segment ids
@@ -585,6 +600,26 @@ def distributed_nmf(
                 start = seg_crop.stop
             S[:, i] = comp.reshape(np.prod(ts[1:]))
 
+        # per-voxel limit, from the same plane windows as S above: the fine-plane
+        # index at the centre of each window, including the cut windows at the
+        # first and last plane of the volume
+        S_max = S_max_core = None
+        if max_light_per_voxel:
+            centres, start = [], 0
+            for j in range(ts[1]):
+                if includes_first_plane and j == 0:
+                    window_start = (pf//2 + 1) - pf
+                    start = pf//2 + 1
+                elif includes_last_plane and j == ts[1] - 1:
+                    window_start = segments.shape[0] - (pf//2 + 1)
+                else:
+                    window_start = start
+                    start += pf
+                centres.append(window_start + (pf - 1) / 2)
+            S_max, S_max_core = build_max_light_per_voxel(
+                segments, labels, pf, segments_spacing,
+                plane_centres=centres, **max_light_per_voxel)
+
         # format search neighborhoods
         if neighborhood == 'weights':
             B = neighborhood_by_weights(
@@ -611,6 +646,7 @@ def distributed_nmf(
                 # the canvas this block's S lives on, so nmf_pytorch can find
                 # a voxel's neighbours. Same shape B was built with.
                 spatial_shape=ts[1:],
+                S_max=S_max, S_max_core=S_max_core,
                 **kwargs,
             ))
         else:
