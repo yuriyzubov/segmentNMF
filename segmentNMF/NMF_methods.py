@@ -379,6 +379,97 @@ STEP_SIZE_NORMS = ('sum_of_squares', 'sum')
 NORM_FLOOR = 1e-6
 
 
+def parse_spatial_smoothness(value):
+    """Read spatial_smoothness as (step, (wz, wy, wx)).
+
+    A sequence [z, y, x] is the pull strength along each axis. The step is
+    their sum. Only the ratios matter as weights, so they are divided by the
+    largest one here.
+
+    A scalar L is the same as [L, L, L]: step 3 * L, and equal weights. To keep
+    the smoothing lateral, put 0 in the z slot.
+
+    None, 0, and a vector of zeros all mean "no smoothing" and give step 0.
+
+    >>> parse_spatial_smoothness([0, 0.01, 0.01])   # lateral only
+    (0.02, (0.0, 1.0, 1.0))
+    >>> parse_spatial_smoothness(0.01)              # all 3 axes
+    (0.03, (1.0, 1.0, 1.0))
+    >>> parse_spatial_smoothness(None)              # off
+    (0.0, (1.0, 1.0, 1.0))
+    """
+    if value is None:
+        return 0.0, (1.0, 1.0, 1.0)
+    if np.isscalar(value):
+        value = (value, value, value)
+    w = tuple(float(v) for v in value)
+    if len(w) != 3:
+        raise ValueError('spatial_smoothness must be a scalar or 3 values '
+                         '[z, y, x], got {}'.format(value))
+    if any(v < 0.0 for v in w):
+        raise ValueError('spatial_smoothness values must not be negative, '
+                         'got {}'.format(value))
+    top = max(w)
+    if top == 0.0:
+        return 0.0, (1.0, 1.0, 1.0)
+    return sum(w), tuple(v / top for v in w)
+
+
+def _add_neighbours(dst, src, axis, weight):
+    """Add `weight` times each neighbour along `axis` of `src` into `dst`.
+
+    Both arrays are (n_components, nz, ny, nx), so `axis` is 1, 2 or 3. The
+    two narrow views are one position apart, and that offset is the shift. A
+    face has no neighbour outside the array, so nothing is added there.
+    """
+    if not weight:
+        return
+    n = src.shape[axis]
+    torch.narrow(dst, axis, 1, n - 1).add_(
+        weight * torch.narrow(src, axis, 0, n - 1))
+    torch.narrow(dst, axis, 0, n - 1).add_(
+        weight * torch.narrow(src, axis, 1, n - 1))
+
+
+def lateral_neighbour_counts(spatial_shape, weights=(0.0, 1.0, 1.0),
+                             device=None, dtype=None):
+    """The divisor for lateral_neighbour_mean, one value per position.
+
+    `weights` is (wz, wy, wx). Each present neighbour along an axis adds that
+    axis weight. A missing neighbour at a face adds nothing, so its weight
+    goes to the neighbours that are present. Never returns 0, so it is safe
+    to divide by.
+
+    The result is (1, 1, ny, nx) when wz is 0, and (1, nz, ny, nx) otherwise.
+    Both broadcast against (n_components, nz, ny, nx).
+
+    Computed once, outside the iteration loop.
+    """
+    nz, ny, nx = spatial_shape[0], spatial_shape[1], spatial_shape[2]
+    o = torch.ones((1, nz if weights[0] else 1, ny, nx),
+                   device=device, dtype=dtype)
+    c = torch.zeros_like(o)
+    for axis, weight in enumerate(weights, start=1):
+        _add_neighbours(c, o, axis, weight)
+    return torch.clamp(c, min=1e-12)
+
+
+def lateral_neighbour_mean(x, counts, weights=(0.0, 1.0, 1.0)):
+    """The weighted mean of a voxel's neighbours, excluding the voxel itself.
+
+    `x` is (n_components, nz, ny, nx). `counts` must come from
+    lateral_neighbour_counts for the same shape AND the same `weights`.
+
+    `weights` is (wz, wy, wx). A z step is often much longer than a lateral
+    step, and wz must then be smaller than wy and wx. At wz 0 nothing links
+    the planes, and each plane is fitted on its own.
+    """
+    s = torch.zeros_like(x)
+    for axis, weight in enumerate(weights, start=1):
+        _add_neighbours(s, x, axis, weight)
+    return s / counts
+
+
 def frobenius_norm_pytorch(V, S, H):
     """Calculate the Frobenius norm objective.
 
@@ -401,7 +492,8 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
                 S_lr: float = 1e-1, step_size_norm: str = 'sum_of_squares',
                 objective_threshold: float = None, min_iterations: int = 50,
                 objective_rtol: float = 1e-4, objective_window: int = 50,
-                footprint_rtol: float = 1e-3, footprint_window: int = 100):
+                footprint_rtol: float = 1e-3, footprint_window: int = 100,
+                spatial_smoothness=None, spatial_shape=None):
 
     """Compute NMF using gradient descent
 
@@ -437,6 +529,31 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         Early stopping needs EVERY enabled test to pass. Setting one of the two rtols
         to None removes that test as a requirement, it does not switch early stopping
         off. To run all num_iterations, set objective_rtol AND footprint_rtol to None.
+        spatial_smoothness: A scalar, or 3 values [z, y, x]. Move each spatial weight
+            toward the mean of its neighbours, once per iteration. 0 or None disables
+            it (default: None). Requires spatial_shape.
+
+            A vector gives the pull strength along each axis, and the step is their
+            sum. A scalar L is the same as [L, L, L]. To keep the smoothing lateral,
+            put 0 in the z slot. Give z a small weight when one z step is much larger
+            than one lateral step, or the smoothing joins cells in different planes.
+
+            WHY. Nothing else in the objective couples a voxel to the voxel beside it,
+            so the fit is free to delete single voxels out of a smooth patch. That
+            cuts one footprint into many small pieces.
+
+            This term is the force that the gradient of a roughness penalty gives, sum
+            over neighbour pairs of (S[a] - S[b])**2, but taken with a step of its own
+            instead of the data step. That keeps the value readable: 0.1 moves a
+            weight 10 percent of the way to the local mean each iteration. It is
+            scaled by B, so it cannot push a footprint outward where B is small.
+
+            Too large a value merges neighbouring cells. Watch the fraction of voxels
+            with 2 or more cells, and the trace correlation between neighbour cells.
+            Neither may rise.
+        spatial_shape: The (nz, ny, nx) shape of the spatial canvas, needed to find a
+            voxel's neighbours. Its product must equal S_init.shape[0]. Only used when
+            spatial_smoothness is on (default: None).
 
     Returns:
         A tuple of PyTorch tensors representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
@@ -473,6 +590,23 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
     nnz_history = []
     objective_done = False
 
+    # smoothing, prepared once
+    counts = None
+    smooth_step, smooth_w = parse_spatial_smoothness(spatial_smoothness)
+    if smooth_step:
+        if spatial_shape is None:
+            raise ValueError('spatial_smoothness requires spatial_shape')
+        spatial_shape = tuple(int(v) for v in spatial_shape)
+        if len(spatial_shape) != 3:
+            raise ValueError('spatial_shape must be (nz, ny, nx), got '
+                             '{}'.format(spatial_shape))
+        n_spatial = spatial_shape[0] * spatial_shape[1] * spatial_shape[2]
+        if n_spatial != S.shape[0]:
+            raise ValueError('spatial_shape {} holds {} voxels, but S has {}'
+                             .format(spatial_shape, n_spatial, S.shape[0]))
+        counts = lateral_neighbour_counts(spatial_shape, weights=smooth_w,
+                                          device=device, dtype=S.dtype)
+
     # messing around with line search, keeping the value of the last iteration as the starting point for the next
     # With the idea that, during training, the learning rate should keep decreasing
     S_step_size = S_lr
@@ -500,6 +634,17 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         S += S_gradient
         S = torch.maximum(S, torch.Tensor([0]).to(S.device))
         S = torch.minimum(S, torch.Tensor([1]).to(S.device))  # we want amplitude in temporal not spatial components
+
+        # Pull each weight toward the mean of its neighbours, so an isolated
+        # speck is pushed down and a voxel inside a patch is held up.
+        if smooth_step:
+            n_comp = S.shape[1]
+            avg = lateral_neighbour_mean(
+                S.T.reshape((n_comp,) + spatial_shape), counts,
+                weights=smooth_w)
+            avg = avg.reshape(n_comp, -1).T
+            S = S + smooth_step * B * (avg - S)
+            S = torch.clamp(S, 0.0, 1.0)
 
         # Save gradient steps
         S_gradients.append(torch.mean(S_gradient).item())
