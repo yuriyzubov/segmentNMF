@@ -150,9 +150,83 @@ def frobenius_norm(V, S, H):
     return objective
 
 
+def objective_settled(objectives, i, rtol, window, min_iterations):
+    """True once the objective has stopped falling by a meaningful fraction.
+
+    Replaces an older rule that had two faults. That rule compared an ABSOLUTE
+    difference between two iterations, so one setting could not serve blocks of
+    different size: the objective is a Frobenius norm, which grows with the
+    voxel count. And it stopped on a single uphill step, which gradient descent
+    produces routinely while it is still making progress.
+
+    Here the mean of the last `window` objectives is compared against the mean
+    of the `window` before it, and the drop is asked for as a FRACTION. The mean
+    absorbs step to step noise. The fraction removes the block size, so the same
+    rtol means the same thing on a 128^3 core and on a single cell block.
+
+    A window that rises gives a negative drop, which is below any positive rtol.
+    A real increase therefore still stops the fit, but a single step cannot.
+
+    Tested only every `window` iterations, so the two windows never overlap.
+    """
+    n = i + 1
+    if rtol is None or n < max(min_iterations, 2 * window) or n % window != 0:
+        return False
+    prev = float(np.mean(objectives[n - 2 * window:n - window]))
+    curr = float(np.mean(objectives[n - window:n]))
+    if prev <= 0:
+        return False
+    drop = (prev - curr) / prev
+    if drop < rtol:
+        print('Objective settled: relative drop {:.2e} over {} iterations '
+              '< {:.2e}'.format(drop, window, rtol))
+        return True
+    return False
+
+
+def footprint_settled(nnz_history, rtol):
+    """True once the number of surviving spatial voxels has stopped changing.
+
+    The reconstruction error ||V - S @ H|| is not enough on its own. It can go
+    flat while voxels still drop out of the footprints one by one, because
+    each lost voxel changes the error very little. A run stopped on the error
+    alone can leave a footprint that is still changing.
+
+    `nnz_history` must be sampled on a fixed interval, so that two neighbouring
+    entries are always the same number of iterations apart.
+    """
+    if len(nnz_history) < 2:
+        return False
+    prev, curr = nnz_history[-2], nnz_history[-1]
+    if curr <= 0:
+        return False
+    change = abs(prev - curr) / curr
+    if change < rtol:
+        print('Footprint settled: {} voxels, {:.2e} relative change'.format(
+            curr, change))
+        return True
+    return False
+
+
+def check_objective_threshold(objective_threshold):
+    """Raise if a caller still sets the removed objective_threshold.
+
+    It compared an absolute objective difference between two neighbouring
+    iterations, which cannot serve blocks of different size. A silent ignore
+    would let an old config run with a stopping rule it did not ask for.
+    """
+    if objective_threshold is not None:
+        raise ValueError(
+            'objective_threshold was removed. Use objective_rtol: the fit '
+            'stops when the error falls by less than this fraction over '
+            'objective_window steps.')
+
+
 def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr=1,
-                S_lr=1e-6, objective_threshold=1e-6, estimate_noise_component=True,
-                min_iterations: int = 50):
+                S_lr=1e-6, objective_threshold=None, estimate_noise_component=True,
+                min_iterations: int = 50, objective_rtol: float = 1e-4,
+                objective_window: int = 50, footprint_rtol: float = 1e-3,
+                footprint_window: int = 100):
     """Compute NMF using gradient descent
 
     Args:
@@ -165,14 +239,29 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
         update_int: The interval at which to display progress updates (default: 10).
         H_lr: The learning rate for the H matrix (default: 1).
         S_lr: The learning rate for the S matrix (default: 1e-6).
-        objective_threshold: The stopping criterion for the objective (default: 1e-6).
+        objective_threshold: Removed. Setting it raises an error. Use objective_rtol.
         estimate_noise_component: Whether to estimate a noise component (default: True).
         min_iterations: The minimum number of iterations to run the algorithm for (default: 50).
+        objective_rtol: Stop once the objective's mean falls by less than this FRACTION over
+            objective_window iterations, against the window before it. Scale free, so one
+            value fits every block size. None disables it (default: 1e-4).
+        objective_window: How many iterations each of the two compared means covers
+            (default: 50). The test runs every objective_window iterations.
+        footprint_rtol: Stop once the count of surviving spatial voxels changes by less
+            than this FRACTION over footprint_window iterations. Needed because the
+            objective can settle before the footprint does. None disables it
+            (default: 1e-3).
+        footprint_window: How many iterations between two voxel counts (default: 100).
+
+        Early stopping needs EVERY enabled test to pass. Setting one of the two rtols
+        to None removes that test as a requirement, it does not switch early stopping
+        off. To run all num_iterations, set objective_rtol AND footprint_rtol to None.
 
     Returns:
         A tuple of NumPy arrays representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
     """
 
+    check_objective_threshold(objective_threshold)
     n_components = H_init.shape[0]
 
     # If specified, add an additional 'noise' component
@@ -188,6 +277,10 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
     correlations = []
     H_gradients = []
     S_gradients = []
+    # sampled every footprint_window iterations, so two neighbouring entries are
+    # always the same distance apart
+    nnz_history = []
+    objective_done = False
 
     S = S_init
     H = H_init
@@ -235,14 +328,23 @@ def nmf(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_
                                                                               np.min(correlations[-1]))
             tqdm.write(progress_str)
 
-        # Check stopping criterion
-        if objective_threshold is not None and i > min_iterations:
-            if abs(objectives[i] - objectives[i - 1]) < objective_threshold:
-                print('Reached stopping criterion (d objective < {})'.format(objective_threshold))
-                break
-            if objectives[i] > objectives[i - 1]:
-                print('Objective increased: [i-1]: {}, [i]: {}'.format(objectives[i-1], objectives[i]))
-                break
+        # Check stopping criterion.
+        #
+        # Both tests must pass, because they can settle at different times.
+        # See footprint_settled.
+        if footprint_window and (i + 1) % footprint_window == 0:
+            nnz_history.append(int(np.count_nonzero(S[:, :n_components])))
+        if objective_rtol is None and footprint_rtol is None:
+            continue
+        if objective_rtol is not None:
+            objective_done = objective_done or objective_settled(
+                objectives, i, objective_rtol, objective_window, min_iterations)
+            if not objective_done:
+                continue
+        if footprint_rtol is not None and not footprint_settled(
+                nnz_history, footprint_rtol):
+            continue
+        break
 
     if H_true is not None:
         return S, H, objectives, correlations
@@ -297,7 +399,9 @@ def frobenius_norm_pytorch(V, S, H):
 
 def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr: float = 1e-1,
                 S_lr: float = 1e-1, step_size_norm: str = 'sum_of_squares',
-                objective_threshold: float = 1e-2, min_iterations: int = 50):
+                objective_threshold: float = None, min_iterations: int = 50,
+                objective_rtol: float = 1e-4, objective_window: int = 50,
+                footprint_rtol: float = 1e-3, footprint_window: int = 100):
 
     """Compute NMF using gradient descent
 
@@ -317,13 +421,28 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
             the footprint, weighted by S, and stays in data units.
             'sum_of_squares' takes the least squares step, which is exact for a
             component that sits alone. Each choice needs its own H_lr and S_lr.
-        objective_threshold: The stopping criterion for the objective (default: 1e-2).
+        objective_threshold: Removed. Setting it raises an error. Use objective_rtol.
         min_iterations: The minimum number of iterations to run the algorithm for (default: 50).
+        objective_rtol: Stop once the objective's mean falls by less than this FRACTION over
+            objective_window iterations, against the window before it. Scale free, so one
+            value fits every block size. None disables it (default: 1e-4).
+        objective_window: How many iterations each of the two compared means covers
+            (default: 50). The test runs every objective_window iterations.
+        footprint_rtol: Stop once the count of surviving spatial voxels changes by less
+            than this FRACTION over footprint_window iterations. Needed because the
+            objective can settle before the footprint does. None disables it
+            (default: 1e-3).
+        footprint_window: How many iterations between two voxel counts (default: 100).
+
+        Early stopping needs EVERY enabled test to pass. Setting one of the two rtols
+        to None removes that test as a requirement, it does not switch early stopping
+        off. To run all num_iterations, set objective_rtol AND footprint_rtol to None.
 
     Returns:
         A tuple of PyTorch tensors representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
     """
 
+    check_objective_threshold(objective_threshold)
     if step_size_norm not in STEP_SIZE_NORMS:
         raise ValueError('step_size_norm must be one of {}, got {}'
                          .format(STEP_SIZE_NORMS, step_size_norm))
@@ -349,6 +468,10 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
     correlations = []
     H_gradients = []
     S_gradients = []
+    # sampled every footprint_window iterations, so two neighbouring entries are
+    # always the same distance apart
+    nnz_history = []
+    objective_done = False
 
     # messing around with line search, keeping the value of the last iteration as the starting point for the next
     # With the idea that, during training, the learning rate should keep decreasing
@@ -397,14 +520,23 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
                                                                               np.nanmin(correlations[-1]))
             tqdm.write(progress_str)
 
-        # Check stopping criterion
-        if objective_threshold is not None and i > min_iterations:
-            if abs(objectives[i] - objectives[i - 1]) < objective_threshold:
-                print('Reached stopping criterion (d objective < {})'.format(objective_threshold))
-                break
-            if objectives[i] > objectives[i - 1]:
-                print('Objective increased: [i-1]: {}, [i]: {}'.format(objectives[i-1], objectives[i]))
-                break
+        # Check stopping criterion.
+        #
+        # Both tests must pass, because they can settle at different times.
+        # See footprint_settled.
+        if footprint_window and (i + 1) % footprint_window == 0:
+            nnz_history.append(int(torch.count_nonzero(S).item()))
+        if objective_rtol is None and footprint_rtol is None:
+            continue
+        if objective_rtol is not None:
+            objective_done = objective_done or objective_settled(
+                objectives, i, objective_rtol, objective_window, min_iterations)
+            if not objective_done:
+                continue
+        if footprint_rtol is not None and not footprint_settled(
+                nnz_history, footprint_rtol):
+            continue
+        break
 
     # Move tensors back to the CPU
     S = S.cpu().numpy()
