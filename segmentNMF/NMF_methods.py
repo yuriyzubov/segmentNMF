@@ -1,5 +1,6 @@
 """functions implementing the NMF algorithm for demixing neural signals using segmentation data"""
 
+import numba
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -498,13 +499,147 @@ def smooth_in_time(H, a, freq):
     return torch.fft.irfft(F, n=2 * n_t, dim=1)[:, :n_t]
 
 
+@numba.njit(cache=False)
+def _ar1_project_row(y, gamma, out):
+    """out = argmin |out - y|^2 over traces with out[0] >= 0 and
+    out[t] >= gamma * out[t - 1]. The pool algorithm of OASIS (Friedrich et al.
+    2017): a pool is a run of frames that decays at gamma from its first value."""
+    n_t = y.shape[0]
+    v = np.empty(n_t)                   # pool value at its first frame
+    w = np.empty(n_t)                   # pool weight, sum of gamma^(2k)
+    first = np.empty(n_t, np.int64)
+    length = np.empty(n_t, np.int64)
+    p = -1
+    pinned = False                      # pool 0 held at 0 by out[0] >= 0
+    for t in range(n_t):
+        p += 1
+        v[p] = y[t]
+        w[p] = 1.0
+        first[p] = t
+        length[p] = 1
+        while True:
+            if p == 0:
+                if v[0] < 0.0:
+                    pinned = True
+                    v[0] = 0.0
+                break
+            g = gamma ** length[p - 1]
+            if v[p] >= g * v[p - 1]:
+                break
+            # pool p falls too fast after pool p - 1: merge pool p into pool p - 1
+            if not (p == 1 and pinned):
+                g2 = g * g
+                v[p - 1] = (w[p - 1] * v[p - 1] + g * w[p] * v[p]) / (w[p - 1] + g2 * w[p])
+                w[p - 1] += g2 * w[p]
+            length[p - 1] += length[p]
+            p -= 1
+    for q in range(p + 1):
+        g = 1.0
+        for k in range(length[q]):
+            out[first[q] + k] = v[q] * g
+            g *= gamma
+
+
+@numba.njit(parallel=True, cache=False)
+def _ar1_project(Y, gamma):
+    """_ar1_project_row for every row of Y, in parallel."""
+    out = np.empty_like(Y)
+    for i in numba.prange(Y.shape[0]):
+        _ar1_project_row(Y[i], gamma, out[i])
+    return out
+
+
+def calcium_step(H, a, gamma, baseline):
+    """The proximal step of a * sum_t s[t], row by row, with H = baseline + c,
+    c[t] = gamma * c[t-1] + s[t] and s >= 0. a and baseline have shape (n_rows, 1).
+
+    One round of block coordinate descent: the exact c for the given baseline,
+    then the baseline for that c. Returns (H, baseline). Run every iteration with
+    the baseline it returned, the pair converges to the joint solution.
+
+    sum_t s[t] = (1 - gamma) * sum_t c[t] + gamma * c[-1], so the penalty is
+    linear in c, and the step is a projection of H - baseline - a * weights.
+    The last frame has no frame after it, so its weight is 1, not 1 - gamma."""
+    n_t = H.shape[1]
+    weights = torch.full((1, n_t), 1.0 - gamma, device=H.device, dtype=H.dtype)
+    weights[0, -1] = 1.0
+    target = (H - baseline - a * weights).cpu().numpy().astype(np.float64)
+    c = torch.from_numpy(_ar1_project(target, gamma)).to(device=H.device, dtype=H.dtype)
+    baseline = torch.clamp(torch.mean(H - c, dim=1, keepdim=True), min=0.0)
+    return baseline + c, baseline
+
+
+def trace_noise(Y, gamma):
+    """Noise variance of each row of Y, shape (n_rows, 1), measured from the falls only.
+
+    Under the calcium model, Y[t] - gamma * Y[t-1] is (1 - gamma) * baseline + s[t]
+    + n[t] - gamma * n[t-1], with s >= 0 and n the noise. Events only add to it, so
+    the values below its median hold noise only. Their spread (median distance
+    below the median / 0.6745, as for a normal distribution) is the noise of
+    n[t] - gamma * n[t-1], which has variance (1 + gamma^2) times the noise.
+
+    WHY NOT THE POWER SPECTRUM. CNMF measures the noise from the power at periods
+    of 2 to 4 frames. That assumes events change slowly from frame to frame. When
+    an event rises within one frame, its rise has power there too, and the noise
+    is measured too high in active cells."""
+    e = Y[:, 1:] - gamma * Y[:, :-1]
+    m = torch.median(e, dim=1, keepdim=True).values
+    below = torch.where(e < m, m - e, torch.full_like(e, float('nan')))
+    spread = torch.nanmedian(below, dim=1, keepdim=True).values / 0.6745
+    return torch.nan_to_num(spread) ** 2 / (1.0 + gamma ** 2)
+
+
+def noise_feedback(mu, raw, H, noise_var, rate=0.5, limits=(0.1, 3.0)):
+    """One step of the feedback for calcium_rule penalty 'noise', row by row.
+
+    mu goes up where the fit leaves less than the noise between the raw trace and
+    H, and down where it leaves more. A step changes mu by a factor of 0.5 to 2.
+    The fixed point leaves exactly the noise. mu then stays between limits[0] and
+    limits[1] times the noise's standard deviation.
+
+    WHY THE LIMITS. The fixed point does not always exist. In a trace with no
+    events, a large mu already removes every rise, and a larger mu changes nothing.
+    A noise measure a little above what the fit leaves then raises mu by the same
+    factor in every iteration, until mu is inf and the trace and every trace that
+    shares voxels with it are NaN. In a trace with large events the fit can leave
+    more than the noise at any mu, and mu falls to 0. The limits stop both."""
+    left = torch.mean((raw - H) ** 2, dim=1, keepdim=True)
+    factor = (noise_var / torch.clamp(left, min=1e-30)) ** rate
+    sd = torch.sqrt(noise_var)
+    return torch.clamp(mu * torch.clamp(factor, 0.5, 2.0), limits[0] * sd, limits[1] * sd)
+
+
+CALCIUM_RULE_KEYS = ('decay', 'penalty', 'noise_limits')
+
+
+def parse_calcium_rule(rule):
+    """Read calcium_rule as (decay, penalty, noise_limits).
+
+    None is off: (None, 0.0, (0.1, 3.0)). A dict must hold 'decay', and may hold
+    'penalty' and 'noise_limits'. Any other key raises, so a typo cannot switch a
+    setting off in silence.
+    """
+    if rule is None:
+        return None, 0.0, (0.1, 3.0)
+    if not isinstance(rule, dict):
+        raise ValueError('calcium_rule must be a dict or None, got {!r}'.format(rule))
+    unknown = sorted(set(rule) - set(CALCIUM_RULE_KEYS))
+    if unknown:
+        raise ValueError('calcium_rule has unknown keys {}; known keys are {}'
+                         .format(unknown, CALCIUM_RULE_KEYS))
+    if rule.get('decay') is None:
+        raise ValueError("calcium_rule needs 'decay'")
+    return (rule['decay'], rule.get('penalty', 0.0),
+            rule.get('noise_limits', (0.1, 3.0)))
+
+
 def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_int=10, H_lr: float = 1e-1,
                 S_lr: float = 1e-1, step_size_norm: str = 'sum_of_squares',
                 objective_threshold: float = None, min_iterations: int = 50,
                 objective_rtol: float = 1e-4, objective_window: int = 50,
                 footprint_rtol: float = 1e-3, footprint_window: int = 100,
                 spatial_smoothness=None, spatial_shape=None, S_max=None,
-                S_max_core=None, temporal_smoothness=None):
+                S_max_core=None, temporal_smoothness=None, calcium_rule=None):
 
     """Compute NMF using gradient descent
 
@@ -598,6 +733,41 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
             mirror boundaries), so it is stable at any lam and does not slow the
             data step. Its cost: real changes faster than about one frame are
             smoothed too. Check the recovery of a known signal.
+        calcium_rule: dict, or None (default, off). The calcium shape rule, with these keys:
+
+            decay: tau > 0 in frames, required. Each trace becomes baseline + c, with
+                c[t] = gamma * c[t-1] + s[t], s >= 0 and gamma = exp(-1 / tau). One tau
+                holds for every component. A trace can rise by any amount in one frame.
+                It cannot fall faster than gamma per frame. The baseline is one value
+                per component, >= 0, with no penalty.
+            penalty: mu >= 0, or 'noise' (default: 0). Adds mu * |S_i|^2 * sum_t s[t]
+                for every component to the objective. mu has the units of H. An
+                isolated event loses about mu * (1 - gamma^2) of its height. With mu = 0
+                only the shape rule acts, and no event shrinks.
+
+                'noise' sets mu for every component in every iteration, as CNMF does
+                (Pnevmatikakis et al. 2016, Neuron): the fit may remove as much from a
+                component's raw trace as the noise of that trace, and no more. The raw
+                trace is the least-squares trace, H_i + S_i . R / |S_i|^2. Its noise is
+                measured from its falls, see trace_noise. mu follows noise_feedback,
+                from a start of the noise's standard deviation.
+            noise_limits: (low, high), 0 <= low <= high (default: (0.1, 3.0)). With
+                penalty 'noise', each component's mu stays between low and high times
+                the standard deviation of its noise. Without the high limit, mu grows
+                to inf on a trace where the fit leaves less than the noise at every
+                mu. A lower high limit keeps more of the small events.
+
+            Cannot be combined with temporal_smoothness.
+
+            WHY. temporal_smoothness stops the trade of noise between overlapping
+            footprints, but it also lowers and widens short events. A calcium trace
+            rises fast and decays slowly. A frame of noise traded between two
+            traces puts a fast fall in both: one trace falls, the other rises and
+            falls back. The shape rule blocks these falls, and it keeps the rise.
+
+            Taken as a proximal step after each H gradient step, see calcium_step.
+            Its cost: a cell that decays faster than tau is slowed to tau, so do not
+            choose tau longer than the indicator's decay. Noise can still rise.
 
     Returns:
         A tuple of PyTorch tensors representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
@@ -637,6 +807,28 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
     t_smooth = float(temporal_smoothness or 0.0)
     if t_smooth < 0:
         raise ValueError('temporal_smoothness must be >= 0, got {}'.format(temporal_smoothness))
+    calcium_decay, calcium_penalty, noise_limits = parse_calcium_rule(calcium_rule)
+    ca_noise = isinstance(calcium_penalty, str)
+    if ca_noise:
+        if calcium_penalty != 'noise':
+            raise ValueError("calcium_rule penalty must be a number >= 0 or 'noise', got {}"
+                             .format(calcium_penalty))
+        ca_penalty = None           # set from the noise at the first iteration
+    else:
+        ca_penalty = float(calcium_penalty or 0.0)
+        if ca_penalty < 0:
+            raise ValueError('calcium_rule penalty must be >= 0, got {}'.format(calcium_penalty))
+    noise_limits = tuple(float(v) for v in noise_limits)
+    if len(noise_limits) != 2 or not 0.0 <= noise_limits[0] <= noise_limits[1]:
+        raise ValueError('calcium_rule noise_limits must be (low, high) with 0 <= low <= high, got {}'
+                         .format(noise_limits))
+    if calcium_decay is not None:
+        if not calcium_decay > 0:
+            raise ValueError('calcium_rule decay must be > 0, got {}'.format(calcium_decay))
+        if t_smooth:
+            raise ValueError('use temporal_smoothness or calcium_rule, not both')
+        ca_gamma = float(np.exp(-1.0 / float(calcium_decay)))
+        ca_baseline = torch.clamp(torch.amin(H, dim=1, keepdim=True), min=0.0)
     if t_smooth:
         # eigenvalues of the 1D Laplacian with mirror boundaries (rfft of the
         # mirrored trace, length 2T)
@@ -681,6 +873,11 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
 
         # Update H matrix with dynamically estimated step size
         H_gradient = S.T @ (V - S @ H)
+        if ca_noise:
+            raw = H + H_gradient / torch.clamp(torch.sum(S * S, dim=0)[:, None], min=NORM_FLOOR)
+            noise_var = trace_noise(raw, ca_gamma)
+            if ca_penalty is None:
+                ca_penalty = torch.sqrt(noise_var)
         norm = torch.sum(S * S if square_norm else S, dim=0)[:, None]
         norm = torch.clamp(norm, min=NORM_FLOOR)
         H_step_size = H_lr / norm
@@ -690,6 +887,12 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
         if t_smooth:
             H = smooth_in_time(H, H_step_size * t_smooth * torch.sum(S * S, dim=0)[:, None],
                                t_freq)
+        if calcium_decay is not None:
+            H, ca_baseline = calcium_step(
+                H, H_step_size * ca_penalty * torch.sum(S * S, dim=0)[:, None],
+                ca_gamma, ca_baseline)
+            if ca_noise:
+                ca_penalty = noise_feedback(ca_penalty, raw, H, noise_var, limits=noise_limits)
         H = torch.maximum(H, torch.Tensor([0]).to(H.device))
 
         # Update S matrix with spatial constraint
