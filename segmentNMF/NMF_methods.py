@@ -610,6 +610,7 @@ def noise_feedback(mu, raw, H, noise_var, rate=0.5, limits=(0.1, 3.0)):
 
 
 CALCIUM_RULE_KEYS = ('decay', 'penalty', 'noise_limits')
+ADD_RESIDUAL_CHOICES = ('none', 'cnmf', 'split')
 
 
 def parse_calcium_rule(rule):
@@ -639,7 +640,8 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
                 objective_rtol: float = 1e-4, objective_window: int = 50,
                 footprint_rtol: float = 1e-3, footprint_window: int = 100,
                 spatial_smoothness=None, spatial_shape=None, S_max=None,
-                S_max_core=None, temporal_smoothness=None, calcium_rule=None):
+                S_max_core=None, temporal_smoothness=None, calcium_rule=None,
+                add_residual='none'):
 
     """Compute NMF using gradient descent
 
@@ -768,6 +770,35 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
             Taken as a proximal step after each H gradient step, see calcium_step.
             Its cost: a cell that decays faster than tau is slowed to tau, so do not
             choose tau longer than the indicator's decay. Noise can still rise.
+        add_residual: 'none', 'cnmf' or 'split' (default: 'none'). Adds the residual
+            R = V - S @ H back to each returned trace. The fit does not change.
+
+            'none' returns the trace of the fit.
+
+            'cnmf' returns the least-squares trace of each component for its final
+            footprint, with the fitted light of every other component taken away:
+            H_i + S_i . R / |S_i|^2. CNMF gives the same trace as C + YrA.
+
+            'split' shares each voxel's residual between the components in
+            proportion to their mean fitted light there, f_i[v] = S_i[v] mean(H_i)
+            / sum_j S_j[v] mean(H_j): H_i + S_i . (f_i * R) / |S_i|^2. A lone
+            component gets the same trace as 'cnmf'. The shares use the mean over
+            all frames, because a share frame by frame is unstable where a trace is
+            near 0.
+
+            The fit keeps each trace at 0 or above. With the residual added, a
+            component whose baseline is near 0 can go below 0.
+
+            WHY. A rule on the traces (temporal_smoothness, calcium_rule) acts in
+            two places: on the traces that are taken away from a component's
+            neighbours, and on the component's own trace. In the first place it
+            stops the trade of noise between overlapping footprints. In the second
+            it also removes real detail: the shape of a decay, a fall below the
+            baseline, changes smaller than the penalty. Adding the residual keeps
+            the rule in the first place only. 'cnmf' gives the residual of an
+            overlap voxel in full to every component that covers it, so light that
+            no component explains is counted once per component, and overlapping
+            traces correlate. 'split' counts it once in all.
 
     Returns:
         A tuple of PyTorch tensors representing the learned spatial components matrix (S), temporal components matrix (H), and objective values (objectives).
@@ -807,6 +838,9 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
     t_smooth = float(temporal_smoothness or 0.0)
     if t_smooth < 0:
         raise ValueError('temporal_smoothness must be >= 0, got {}'.format(temporal_smoothness))
+    if add_residual not in ADD_RESIDUAL_CHOICES:
+        raise ValueError('add_residual must be one of {}, got {!r}'
+                         .format(ADD_RESIDUAL_CHOICES, add_residual))
     calcium_decay, calcium_penalty, noise_limits = parse_calcium_rule(calcium_rule)
     ca_noise = isinstance(calcium_penalty, str)
     if ca_noise:
@@ -957,6 +991,16 @@ def nmf_pytorch(V, S_init, H_init, B, H_true=None, num_iterations=100, update_in
                 nnz_history, footprint_rtol):
             continue
         break
+
+    if add_residual != 'none':
+        R = V - S @ H
+        W = S
+        if add_residual == 'split':
+            light = S * torch.clamp(torch.mean(H, dim=1), min=0.0)[None, :]
+            W = S * light / torch.clamp(light.sum(dim=1, keepdim=True), min=NORM_FLOOR)
+            del light
+        H = H + (W.T @ R) / torch.clamp(torch.sum(S * S, dim=0)[:, None], min=NORM_FLOOR)
+        del R, W
 
     # Move tensors back to the CPU
     S = S.cpu().numpy()
