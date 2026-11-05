@@ -5,6 +5,7 @@ import time
 import glob
 from ClusterWrap.decorator import cluster as cluster_decorator
 from scipy.ndimage import find_objects
+from scipy.sparse import coo_matrix
 from scipy.spatial import cKDTree
 from segmentNMF.neighborhood import neighborhood_by_distance, neighborhood_by_weights
 from segmentNMF.NMF_methods import nmf, nmf_pytorch
@@ -174,6 +175,7 @@ def distributed_nmf(
     use_gpu=False,
     n_output_segments=None,
     reconstruction_path=None,
+    return_spatial_components=False,
     cluster=None,
     cluster_kwargs={},
     **kwargs,
@@ -311,6 +313,11 @@ def distributed_nmf(
         array can be created to contain the reconstruction:
         space_components @ time_components.
 
+    return_spatial_components : bool (default: False)
+        If True, also return the optimized spatial components, as a sparse
+        matrix. Off by default because it changes the return type from an
+        array to a tuple.
+
     cluster : ClusterWrap.cluster object (default: None)
         Only set if you have constructed your own static cluster. The default
         behavior is to construct a cluster for the duration of this function, then
@@ -337,6 +344,14 @@ def distributed_nmf(
         integer value found in the `segments` array. If `n_output_segments` is
         an integer then N is that number. Integer values not present in
         the `segments` array are NaN value for all T.
+
+    space_components : scipy.sparse.csc_matrix
+        Only returned if `return_spatial_components` is True. An SxN array
+        where S is the number of voxels in one time series frame, flattened
+        C-order, and N matches time_components. Column i is the optimized
+        spatial footprint of the same segment as row i of time_components.
+        Sparse because each footprint is nonzero over only a small part of
+        the volume.
     """
 
     if neighborhood not in ('weights', 'distance'):
@@ -620,7 +635,12 @@ def distributed_nmf(
             )
 
         # time series for the complete cells are what we really need
-        return H_res[:n_segments]
+        if not return_spatial_components:
+            return H_res[:n_segments]
+
+        # sparsify here, not in the caller, to keep the cluster transfer small
+        S_complete = coo_matrix(S_res[:, :n_segments])
+        return H_res[:n_segments], (S_complete, time_series_crop)
 
 
     def reconstruct_per_block(crop):
@@ -708,6 +728,11 @@ def distributed_nmf(
         cluster=cluster, cluster_kwargs=cluster_kwargs,
     )
 
+    # blocks return (H, (S, crop)) pairs when spatial components were requested
+    if return_spatial_components:
+        segment_spatial_components = [x[1] for x in segment_time_components]
+        segment_time_components = [x[0] for x in segment_time_components]
+
     # construct the return array and send it
     output_shape = (n_output_segments, time_series_zarr.shape[0])
     all_time_components = np.empty(output_shape, dtype=np.float32)
@@ -715,5 +740,27 @@ def distributed_nmf(
     for segment_union, components in zip(segment_unions, segment_time_components):
         for segment_id, component in zip(segment_union, components):
             all_time_components[segment_id-1, :] = component
-    return all_time_components
+    if not return_spatial_components:
+        return all_time_components
+
+    # assemble one global sparse (voxels, segments) matrix from the block crops
+    canvas_shape = time_series_zarr.shape[1:]
+    rows, cols, vals = [], [], []
+    for segment_union, (S_block, crop) in zip(segment_unions, segment_spatial_components):
+        crop_shape = tuple(s.stop - s.start for s in crop)
+        offsets = np.array([s.start for s in crop])
+        # crop-local flat row -> 3D -> global 3D -> canvas flat row
+        local_3d = np.unravel_index(S_block.row, crop_shape)
+        global_3d = tuple(c + o for c, o in zip(local_3d, offsets))
+        rows.append(np.ravel_multi_index(global_3d, canvas_shape))
+        # block column j is the j'th complete cell, whose label is segment_union[j]
+        cols.append(np.asarray(segment_union, dtype=np.int64)[S_block.col] - 1)
+        vals.append(S_block.data)
+
+    all_spatial_components = coo_matrix(
+        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(int(np.prod(canvas_shape)), n_output_segments),
+        dtype=np.float32,
+    ).tocsc()
+    return all_time_components, all_spatial_components
 
