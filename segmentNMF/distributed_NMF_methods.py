@@ -167,6 +167,7 @@ def distributed_nmf(
     neighborhood_sigma=2.0,
     core_box=None,
     only_cells=None,
+    spatial_smoothness=None,
     temporary_directory=None,
     use_gpu=False,
     n_output_segments=None,
@@ -251,6 +252,18 @@ def distributed_nmf(
         None runs every block. Each id must be a seed, that is, its box centre
         must fall inside core_box.
 
+    spatial_smoothness : float or [z, y, x] (default: None)
+        Passed to nmf_pytorch. Moves each spatial weight toward the mean of
+        its neighbours, once per iteration, so a footprint does not break into
+        small pieces. None or 0 disables it. Requires use_gpu=True, because
+        only the pytorch nmf implements it.
+
+        Three numbers give the pull along each axis. One number L is the same
+        as [L, L, L]. Put 0 in the z slot to keep the smoothing lateral.
+
+        nmf_pytorch also needs spatial_shape. That is supplied per block, so it
+        is not a parameter here.
+
     temporary_directory : string (default: None)
         Temporary files are created during nmf. The temporary files will be
         in their own folder within the `temporary_directory`. The default is the
@@ -301,6 +314,10 @@ def distributed_nmf(
         an integer then N is that number. Integer values not present in
         the `segments` array are NaN value for all T.
     """
+
+    if spatial_smoothness and not use_gpu:
+        raise ValueError('spatial_smoothness requires use_gpu=True; only '
+                         'nmf_pytorch has it')
 
     # get all segment ids
     print('GETTING UNIQUE SEGMENT IDS')
@@ -539,6 +556,10 @@ def distributed_nmf(
             _pin_worker_gpu()
             S_res, H_res, objectives = _fit_waiting_for_gpu(lambda: nmf_pytorch(
                 V, S, H, B,
+                spatial_smoothness=spatial_smoothness,
+                # the canvas this block's S lives on, so nmf_pytorch can find
+                # a voxel's neighbours. Same shape B was built with.
+                spatial_shape=ts[1:],
                 **kwargs,
             ))
         else:
